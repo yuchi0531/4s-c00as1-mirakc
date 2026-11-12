@@ -48,3 +48,10 @@ make up HOST=192.168.1.154
   （MIT、原作者 otti83 さん）の実装を分割・再利用しています。`NOTICE` を参照。
 - mirakc は [mirakc/mirakc](https://github.com/mirakc/mirakc)（MIT）および
   [yuchi0531/mirakc-BS4K](https://github.com/yuchi0531/mirakc-BS4K) のフォークです。
+
+## 技術資料
+
+- [Phase 0: tuner/libvixs](docs/analysis/phase0-tuner.md)
+- [Phase 0: abs/xcdrv](docs/analysis/phase0-abs.md)
+- [TSID 実測](docs/analysis/tsid-111.md)
+- [4K と HDMI 無し運用](docs/4K-NO-HDMI.md)

@@ -125,8 +125,10 @@ undefined4 FUN_00c66a84(undefined4 path, uint tune, void *param) {
   return FUN_00457858(0, &local_38); // = vEtmMain+0x308
 }
 ```
-`local_38` から始まるスタック構造体がそのまま `0x6004` の body である
-（`Dev/Tune/OID/BID/NID/SID/TSID/RF/NotDecode` の順）。§1.3 の表と一致する。
+`local_38` から始まるスタック構造体を、`vEtmMain+0x308` が 10 word に**再配置**する。
+word1 は `+8` の byte（OID）、word2 は `+0` の word（Dev）、word3 は `+4` の word（Tune）、
+word4 は `+0xa`（NID）、word5 は `+0xc`（SID）、word6 は `+0x10`（RF）、word7 は `+0xe`（TSID）、
+word8 は `+0x14`（NotDecode）、word9 は `+9`（BID）。§1.3 の表と一致する。
 
 ### 1.3 `0x6004` body（10 word）の確定レイアウト
 
@@ -135,7 +137,7 @@ undefined4 FUN_00c66a84(undefined4 path, uint tune, void *param) {
 | word | body offset | 意味 | 本ビルドでの生成元 | evidence |
 |---:|---:|---|---|---|
 | 0 | `+0x00` | 常に 0 | `r0` 引数（`BhvTv…` は 0 を渡す） | `[DIS] 0x457876` |
-| 1 | `+0x04` | OID（操作連番） | `param+0x08` byte（`FUN_c5a098` の戻り） | `[DIS] 0x45787e` |
+| 1 | `+0x04` | OID（操作連番、8-bit） | `param+0x08` byte（`ldrb`。`FUN_c5a098` の戻り） | `[DIS] 0x45787e` |
 | 2 | `+0x08` | Dev（`9`/`0xa`/`0xb`） | `param+0x00` word。`0x200→9, 0x400→10, 0x800→11` | `[DIS] 0x457888`, `0xc66b78–0xc66b90` |
 | 3 | `+0x0c` | Tune（`0`/`1`/`3`/`7`） | `param+0x04` word = 元の `r1` | `[DIS] 0x457894`, `0xc66bfc` |
 | 4 | `+0x10` | NID（4K は `0x0b`） | `param+0x0a` u16 | `[DIS] 0x45789e`, `0xc66c02` |
