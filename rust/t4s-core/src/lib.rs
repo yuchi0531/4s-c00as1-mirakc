@@ -17,3 +17,5 @@ pub mod sys;
 pub mod tuner;
 pub mod tssrc;
 pub mod xcdrv;
+
+pub mod fed_hw;
