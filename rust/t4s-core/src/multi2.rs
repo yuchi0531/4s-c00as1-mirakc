@@ -38,7 +38,7 @@ pub fn decrypt(payload:&mut [u8],iv:&[u8;8],work:&WorkKey) {
         let control:[u8;8]=std::array::from_fn(|i|0x80+i as u8);
         let iv:[u8;8]=std::array::from_fn(|i|0xf0+i as u8);
         let work=schedule(&system,&control);
-        for line in include_str!("fixtures/multi2-reference.txt").lines(){
+        for line in include_str!("../tools/fixtures/multi2-reference.txt").lines(){
             let (n,hex)=line.split_once(' ').unwrap();let n:usize=n.parse().unwrap();
             let mut data:Vec<u8>=(0..hex.len()).step_by(2).map(|i|u8::from_str_radix(&hex[i..i+2],16).unwrap()).collect();
             assert_eq!(data.len(),n);decrypt(&mut data,&iv,&work);
