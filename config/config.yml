@@ -1,0 +1,110 @@
+epg:
+  cache-dir: /opt/t4s/epg
+
+resource:
+  strings-yaml: /opt/t4s/strings.yml
+
+server:
+  addrs:
+    - http: '0.0.0.0:40772'
+
+# BS / CS 2K (ISDB-S) and BS4K (ISDB-S3).
+# channel 値の解釈は t4s-tuner が行う:
+#   BS  : BSxx_y  (xx=トランスポンダ, y=相対TS)
+#   CS  : CSn     (偶数トランスポンダ 2..24)
+#   BS4K: TLV StreamID (10進。例 45328 = 0xB110)
+channels:
+  - name: NHK-BS
+    type: BS
+    channel: BS15_0
+    services: [101, 102]
+  - name: BS-NTV
+    type: BS
+    channel: BS13_0
+    services: [141, 142, 143]
+  - name: BS-Asahi
+    type: BS
+    channel: BS01_0
+    services: [151, 152, 153]
+  - name: BS-TBS
+    type: BS
+    channel: BS01_1
+    services: [161, 162, 163]
+  - name: BS-Tokyo
+    type: BS
+    channel: BS01_2
+    services: [171, 172, 173]
+  - name: BS-Fuji
+    type: BS
+    channel: BS13_1
+    services: [181, 182, 183]
+
+  - name: CS2
+    type: CS
+    channel: CS2
+  - name: CS4
+    type: CS
+    channel: CS4
+
+  - name: NHK-BS4K
+    type: BS4K
+    channel: '45328'
+    services: [101]
+  - name: BS-NTV-4K
+    type: BS4K
+    channel: '45170'
+    services: [141]
+  - name: BS-Asahi-4K
+    type: BS4K
+    channel: '45168'
+    services: [151]
+  - name: BS-TBS-4K
+    type: BS4K
+    channel: '45329'
+    services: [161]
+  - name: BS-Tokyo-4K
+    type: BS4K
+    channel: '45169'
+    services: [171]
+  - name: BS-Fuji-4K
+    type: BS4K
+    channel: '45330'
+    services: [181]
+
+tuners:
+  - name: 4S-C00AS1
+    types: [BS, CS, BS4K]
+    # 選局と生ストリームの取り出しだけ。復号は decode-filter。
+    command: >-
+      /opt/t4s/bin/t4s-tuner
+      --type {{{channel_type}}} --channel {{{channel}}} --duration {{{duration}}} -
+    # BS4K の t4s-tuner は REMUX で MPEG-TS を出すため、変換は恒等。
+    # (TLV のまま出す実装に変える場合はこの行を削除する)
+    tlv-decoder: cat -
+
+filters:
+  # mirakc-arib を入れていない間の恒等フィルタ。
+  # EPGStation のサービス/番組単位配信には mirakc-arib が必要。
+  service-filter:
+    command: cat -
+  program-filter:
+    command: cat -
+  decode-filter:
+    # BS/CS 2K は本体 card デーモンで MULTI2 復号。BS4K は素通し。
+    command: >-
+      /opt/t4s/bin/t4s-cas
+      --type {{{channel_type}}} --channel {{{channel}}}
+
+timeshift:
+  # recorder を定義しない間のプレースホルダ
+  command: cat -
+
+jobs:
+  # EPG ジョブは mirakc-arib / mirakc-arib-tlv が必要。
+  # この構成ではまずストリーム取得を優先し、EPG は無効にしている。
+  scan-services:
+    disabled: true
+  sync-clocks:
+    disabled: true
+  update-schedules:
+    disabled: true

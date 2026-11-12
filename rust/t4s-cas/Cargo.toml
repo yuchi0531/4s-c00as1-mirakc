@@ -1,0 +1,14 @@
+[package]
+name = "t4s-cas"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "mirakc decode-filter (CAS/MULTI2) for the SHARP 4S-C00AS1"
+
+[dependencies]
+t4s-core = { path = "../t4s-core" }
+
+[[bin]]
+name = "t4s-cas"
+path = "src/main.rs"

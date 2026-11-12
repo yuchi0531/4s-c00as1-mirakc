@@ -1,0 +1,12 @@
+[package]
+name = "t4s-probe"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+t4s-core = { path = "../t4s-core" }
+
+[[bin]]
+name = "t4s-probe"
+path = "src/main.rs"

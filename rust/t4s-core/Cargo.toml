@@ -1,0 +1,10 @@
+[package]
+name = "t4s-core"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "XCode6 tuner/CAS plumbing for the SHARP 4S-C00AS1, extracted from Karin-Laboratory/mkra_4S-C00AS1"
+
+[lib]
+path = "src/lib.rs"

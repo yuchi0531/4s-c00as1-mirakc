@@ -1,0 +1,28 @@
+# Attribution / NOTICE
+
+## mkra (t4s-core)
+
+`rust/t4s-core` contains code derived from:
+
+- Karin-Laboratory/mkra_4S-C00AS1
+  https://github.com/Karin-Laboratory/mkra_4S-C00AS1
+  MIT License, Copyright (c) the mkra contributors
+- Original work: otti83/mkra_4S-C00AS1
+  https://github.com/otti83/mkra_4S-C00AS1
+
+The sources were split into a library and two mirakc command binaries
+(`t4s-tuner`, `t4s-cas`), and modified for this repository. The MIT license
+and copyright notices are retained in `LICENSE.mkra`.
+
+## mirakc
+
+- mirakc/mirakc (MIT)
+- yuchi0531/mirakc-BS4K (fork used for BS4K/MMT/TLV support)
+
+The mirakc binary is built from the fork at runtime; it is not vendored here.
+
+## Firmware
+
+No OEM firmware, keys, card data, or broadcast recordings are included.
+The static-analysis artefacts under `.tmp/oem/` are git-ignored and must not
+be committed.
