@@ -39,7 +39,7 @@ make deploy HOST=192.168.1.154
 make up HOST=192.168.1.154
 ```
 
-完全な手順（telnet 開通から API 確認まで）は [docs/SETUP.md](docs/SETUP.md)。
+完全な手順（telnet 開通から API 確認まで）は [docs/SETUP.md と docs/OPERATIONS.md](docs/SETUP.md)。
 
 ## ライセンス / 帰属
 
