@@ -39,13 +39,6 @@ channels:
     channel: BS13_1
     services: [181, 182, 183]
 
-  - name: CS2
-    type: CS
-    channel: CS2
-  - name: CS4
-    type: CS
-    channel: CS4
-
   - name: NHK-BS4K
     type: BS4K
     channel: '45328'

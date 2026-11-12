@@ -62,6 +62,26 @@ fn bs_tsid(channel: &str) -> Option<u16> {
     })
 }
 
+/// 110°CS TSIDs measured from a remote Mirakurun/mirakc PAT (2026-11-13).
+/// The remote server was used only as a TSID data source; no stream is retained.
+fn cs_tsid(transponder: u16) -> Option<u16> {
+    Some(match transponder {
+        2 => 0x6020,
+        4 => 0x7040,
+        6 => 0x7060,
+        8 => 0x6080,
+        10 => 0x60a0,
+        12 => 0x70c0,
+        14 => 0x70e0,
+        16 => 0x7100,
+        18 => 0x7120,
+        20 => 0x7140,
+        22 => 0x7160,
+        24 => 0x7180,
+        _ => return None,
+    })
+}
+
 /// Resolve a `BS`/`CS` channel string to `(RF kHz, TSID)`.  `TSID == 0` means
 /// "learn it from the PAT" (CS has no per-relative-TS table).
 pub fn resolve(channel_type: &str, channel: &str) -> Result<(u32, u16), String> {
@@ -99,7 +119,9 @@ pub fn resolve(channel_type: &str, channel: &str) -> Result<(u32, u16), String> 
             if n < 2 || n > 24 || n % 2 != 0 {
                 return Err(format!("CS channel out of range (even 2..24): {channel}"));
             }
-            Ok((cs_if_khz(n) + LNB_LO_KHZ, 0))
+            let tsid = cs_tsid(n)
+                .ok_or_else(|| format!("unknown CS channel {channel}"))?;
+            Ok((cs_if_khz(n) + LNB_LO_KHZ, tsid))
         }
         _ => Err(format!("{channel_type} is not an ISDB-S channel type")),
     }
@@ -113,8 +135,8 @@ mod tests {
     fn bs_and_cs_match_the_documented_plan() {
         assert_eq!(resolve("BS", "BS15_0"), Ok((11_996_000, 16625)));
         assert_eq!(resolve("BS", "BS01_0"), Ok((11_727_480, 16400)));
-        assert_eq!(resolve("CS", "CS2"), Ok((12_291_000, 0)));
-        assert_eq!(resolve("CS", "ND24"), Ok((12_731_000, 0)));
+        assert_eq!(resolve("CS", "CS2"), Ok((12_291_000, 0x6020)));
+        assert_eq!(resolve("CS", "ND24"), Ok((12_731_000, 0x7180)));
         assert!(resolve("BS", "BS02_0").is_err());
         assert!(resolve("BS", "BS15_9").is_err());
         assert!(resolve("CS", "CS3").is_err());

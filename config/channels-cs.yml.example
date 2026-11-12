@@ -1,0 +1,19 @@
+# CS 2K の定義例。TSID は docs/analysis/tsid-111.md の実測値。
+#
+# 注意: この mirakc-BS4K フォークでは、channels に CS を登録すると
+# /api/channels が応答しなくなる事象を確認している（2026-11-13）。
+# 有効化する場合は 1 チャンネルずつ追加して API を確認すること。
+#
+# channel 値は t4s-tuner が CSn → 実 TSID に解決する。
+#   CS2=0x6020, CS4=0x7040, CS6=0x7060, CS8=0x6080, CS10=0x60a0,
+#   CS12=0x70c0, CS14=0x70e0, CS16=0x7100, CS18=0x7120,
+#   CS20=0x7140, CS22=0x7160, CS24=0x7180
+channels:
+  - name: CS2
+    type: CS
+    channel: CS2
+    services: [296, 298, 299, 339]
+  - name: CS4
+    type: CS
+    channel: CS4
+    services: [250, 292, 301, 323]

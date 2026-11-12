@@ -163,9 +163,13 @@ EPGStation 連携には `mirakc-arib` / `mirakc-arib-tlv` の導入と
 
 ## 8. 既知の制約
 
-- **CS 2K**: チャンネル一覧には出ますが、この実機では CS2 の DEMUX 出力が
-  0 バイトでした（信号または TSID 選択の問題、未検証）。mirakc-BS4K の
-  CS 経路自体もフォークで未テストと明記されています。
+- **CS 2K**: PAT から実 TSID を実測し、`t4s-core/src/isdbs.rs` の
+  `cs_tsid()` に反映済みです（`docs/analysis/tsid-111.md`）。
+  ただし mirakc の `channels` に CS を登録すると `/api/channels` が
+  停止するため、現在の `config.yml` からは外しています。
+  `config/channels-cs.yml.example` に登録用の定義を残しています。
+  t4s-tuner の CS 選局は実 TSID を FED に渡す実装まで完了していますが、
+  この機体での DEMUX 出力確認は未完了です。
 - **BS4K**: 本体が HDMI シンクを検出してデコードを開始しない限り、
   ES リングが作られないため取得できません。詳細は
   [4K-NO-HDMI.md](4K-NO-HDMI.md)。
