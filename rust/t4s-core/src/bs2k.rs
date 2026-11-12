@@ -8,7 +8,7 @@ use crate::{
     xcdrv::{TsiMappingSnapshot, XcDrv},
 };
 use std::{
-    fs, io,
+    io,
     process::Command,
     sync::{
         atomic::{AtomicBool, Ordering},

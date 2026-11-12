@@ -125,7 +125,7 @@ fn passthrough() -> Result<(), String> {
 }
 
 fn descramble(args: &Args) -> Result<(), String> {
-    let (tsid, learn) = match args.tsid {
+    let (tsid, _learn) = match args.tsid {
         Some(t) => (t, t == 0),
         None => match args.channel_type.to_ascii_uppercase().as_str() {
             "BS" => {

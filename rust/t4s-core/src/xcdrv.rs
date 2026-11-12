@@ -171,6 +171,7 @@ const fn ts_recorder_tsi_request(device: u32, port: u32) -> [u32; 4] {
 /// `xcode_tsi_config@0x7bba8` produces these ten fields:
 /// `{port,packet,parallel,enable,use_sync,disable_auto_reset,active_high,
 /// bpc_sel,use_neg_edge,drop_null}`.
+#[allow(dead_code)]
 const fn product_mpeg_ts_tsi_request(port: u32) -> [u32; 10] {
     product_physical_tsi_request(port, ME_PACKET_188, false)
 }
@@ -185,6 +186,7 @@ pub const ME_PACKET_204: u32 = 2;
 pub const ME_PACKET_130: u32 = 3;
 
 /// The product request with only `me_packet` substituted.
+#[allow(dead_code)]
 const fn product_tsi_request_with_packet(port: u32, me_packet: u32) -> [u32; 10] {
     product_physical_tsi_request(port, me_packet, false)
 }
