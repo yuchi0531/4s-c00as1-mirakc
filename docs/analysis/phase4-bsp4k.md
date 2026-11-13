@@ -171,3 +171,7 @@ key 0x00C, type 0 → 2 秒待ち → /api/status の SI を確認
 - 22:50 頃、`decode=0` 再試行直後に実機が **ping 不通 / no route to host** となり、
   遠隔からの復旧不能になった（電源再投入が必要）。
   `/api/channels/BS4K/45328/stream` は未検証のまま。
+- 2026-11-14 00:22 JST、4K 局の連続選局で製品 UI が「選局・再生に失敗しました」の
+  失敗状態（MIXER/Sink=false）になり復帰不能となったため、**ユーザー指示で検証を中止**。
+  45328 以降の API 検証は「未検証・電源断で中止」。詳細は
+  `docs/analysis/phase4-mirakc-api.md` §6。
