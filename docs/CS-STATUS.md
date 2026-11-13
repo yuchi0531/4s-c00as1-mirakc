@@ -34,3 +34,32 @@ CS2 は RF 的に lock まで到達します。しかし、試した 2 つの TS
 `config/config.full.yml` に BS 6 + CS 12 + BS4K 6 を登録し、
 `/api/channels` は 200（1490 bytes）で一覧を返します。
 CS のストリーム要求は tuner open 失敗で 404 になります。
+
+## Phase 1 追加試験（2026-11-13 夜）
+
+静的解析（`docs/analysis/phase1-cs4k.md`）で、製品の 2K DEMUX は常に
+**logical TSI0** を使い、`Dxd_SetTsConfig` は route slot 0→physical TSI0、
+slot 2→physical TSI1 であることを確認した。`abs` は crossbar `0x61f0` を
+書かない（`xc_mini_device_config_tsi(...,0,0,-1)` のみ）。
+
+これに合わせて `bs2k` に native 経路を追加し、CS2 を
+**physical TSI1 → logical TSI0（remap なし）** で再試験した。
+結果は依然 **0 バイト**。lock は `0x67`、`ts_serial=192` のまま。
+TSID 自動/実測の両方で同じ。
+
+4K は `adsb` の TLV demux(type 0x24) が 4 本の 4MiB リングを持ち、
+外部タップは type 0x24 への追加 `connect_output` が正しい（ring の
+max_reader=1 は製品 MMT が消費済み）。ただし TLV demux に選局入力が
+無いため duplicate は 0 バイト。
+
+`bAdsbInitialized` はレポート上の `abs:0x02027184` が
+abs の実マップ（0x8000–0x10d7000）の外にあり、書き込みには使えない。
+`abs` を SIGSTOP して直接 `0x6004` を送る試験も TLV は出ず、
+約1分後に製品側ウォッチドッグで再起動した（abs は CONT 済み、復旧済み）。
+このため製品プロセスの停止は避ける。
+
+## 現在の登録状態
+
+`config.full.yml`（BS6/CS12/BS4K6）で `/api/channels` 200 を一度確認。
+CS 登録時に API が不安定になるため、安定運用は BS/BS4K の
+`config/config.yml` に戻している。CS は `config.full.yml` で再現可能。

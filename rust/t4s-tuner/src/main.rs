@@ -271,17 +271,28 @@ fn run_2k(args: &Args, deadline: Option<Instant>) -> Result<(), String> {
     let drv = open_driver(&args.device)?;
     let legacy = bs2k::legacy_frontend().unwrap_or(false);
     let dirty = Arc::new(AtomicBool::new(false));
+    let is_cs = args.channel_type.eq_ignore_ascii_case("CS");
+    let native_tsi = std::env::var("T4S_NATIVE_TSI").is_ok();
+    // (physical TSI port, logical TSI port, use logical1->physical0 remap)
+    let (physical_port, logical_port, remap) = if is_cs {
+        // Product 2K route: physical TSI1, logical TSI0.  No crossbar write.
+        (1, 0, false)
+    } else if native_tsi {
+        (0, 0, false)
+    } else {
+        (0, 1, true)
+    };
+    let check_tsid = !is_cs;
     let source = bs2k::Source::open(
         Arc::clone(&drv),
         freq,
         tsid,
         // 0 = raw.  CAS/MULTI2 belongs to t4s-cas, not to the tuner.
         0,
-        // CS locks reliably, but this demod does not expose the PAT TSID in
-        // bank2 for CS.  Keep the real TSID in the FED request, skip the
-        // bank2 equality check so the open can proceed.
-        args.channel_type.eq_ignore_ascii_case("BS"),
-        if args.channel_type.eq_ignore_ascii_case("CS") { 1 } else { 0 },
+        check_tsid,
+        physical_port,
+        logical_port,
+        remap,
         &AtomicBool::new(legacy),
         Arc::clone(&dirty),
     )

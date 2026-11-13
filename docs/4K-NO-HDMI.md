@@ -46,3 +46,18 @@ t4s-tuner: 4K selection not confirmed ... / no live 4K ES pair
 
 mirakc 側では BS4K チャンネルの `tlv-decoder` に `cat -` を指定しています。
 これは `t4s-tuner` が REMUX で MPEG-TS を出すためで、TLV のままではありません。
+
+## Phase 1 静的解析の追記
+
+`adsb` の `wrap_demuxInit`（0x4e308）が TLV demux(type 0x24) と
+4 本の 4MiB リングを作り、MMT demux(type 0x25) が各リングを読む。
+TLV リングの max_reader は 1 で製品が消費済み。外部タップは
+type 0x24 の追加 `connect_output`（8 output ports）が正しい。
+`TS_RECODER(0x13)` は TLV 経路では使わない。
+
+duplicate が 0 バイトなのは、TLV demux に **選局入力/ロックが無い**ため。
+`bAdsbInitialized`（abs のレポート値 0x02027184）は実マップ外で
+書き込み不可。`abs` を止めても TLV は出ず、製品ウォッチドッグで
+再起動した。HDMI シンク無しで TLV を出すには、`adsb` の初期化を
+製品自身に完了させる（= HDMI/UI が必要）か、TLV demux の入力を
+自前で構成する Phase 2 の実装が必要。

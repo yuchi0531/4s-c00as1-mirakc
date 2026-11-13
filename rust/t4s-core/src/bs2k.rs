@@ -81,6 +81,8 @@ impl Source {
         service_id: u16,
         check_tsid: bool,
         physical_port: u32,
+        logical_port: u32,
+        remap: bool,
         legacy: &AtomicBool,
         dirty: Arc<AtomicBool>,
     ) -> io::Result<Self> {
@@ -100,7 +102,11 @@ impl Source {
             Some(Decoder::new(card, system, iv, tsid).select_service(service_id))
         };
         let mapping = drv.snapshot_tsi_mapping()?;
-        let restore_physical = if physical_port == 1 { mapping.request(1) } else { None };
+        let restore_physical = if remap {
+            None
+        } else {
+            mapping.request(physical_port as usize)
+        };
         let mut source = Self {
             drv,
             mapping: Some(mapping),
@@ -157,18 +163,18 @@ impl Source {
         source.pipeline = source.drv.create_pipeline()?;
         source.av = source.drv.create_av_sync()?;
         source.drv.set_pipeline(source.av, source.pipeline)?;
-        if physical_port == 0 {
-            source.drv.configure_product_mpeg_ts_tsi(0)?;
+        if remap {
+            source.drv.configure_product_mpeg_ts_tsi(physical_port)?;
             source.drv.map_tsi_one_to_zero()?;
         } else {
-            // 110°CS comes out on physical TSI1; logical TSI1 is already
-            // mapped to it by the identity configuration.
-            source.drv.configure_physical_tsi_packet(1, 188)?;
+            // Native product route: configure the physical port and attach
+            // the DEMUX to logical TSI0.  No crossbar (0x53) write is made.
+            source.drv.configure_physical_tsi_packet(physical_port, 188)?;
         }
         source.drv.set_av_sync_live_mode(source.av)?;
         source.device = source.drv.create_mpeg_ts_demux()?;
         source.drv.set_pipeline(source.device, source.pipeline)?;
-        source.drv.config_ts_recorder_tsi(source.device, 1)?;
+        source.drv.config_ts_recorder_tsi(source.device, logical_port)?;
         source.drv.run_product_demux(source.device)?;
         source.running = true;
         source.buffer = source.drv.create_demux_ts_buffer()?;
