@@ -28,7 +28,20 @@ mirakc は USB 上の ext4 イメージ内の Alpine rootfs で動きます。
   **復号はしない**（scrambling フラグはそのまま）。
   CS も BS と同じ logical TSI1 → physical TSI0 remap を既定で使う。
   旧 native 経路は `T4S_CS_NATIVE_TSI=1`、物理ポートは `T4S_CS_TSI_PORT` で指定。
-  終了時は cleanup が一部失敗しても `restore_frontend()` を必ず実行する。
+- 2K DEMUX の出力 ring は製品既定の **0x6000 units (4.6 MiB)** ではなく
+  **0x18000 units (18 MiB)** で作る。ホスト側の読み出しは約 2 MB/s で、
+  フル CS トランスポンダは約 5–7 MB/s あるため、既定サイズでは数秒で ring が
+  埋まる。埋まった ring への書き込みで ARC がブロックし、`remove_pid` /
+  `disconnect` / `stop` / `destroy` がすべて `XCE_TIMEOUT (1038)` になる。
+  DEMUX が解放されず、**次の `Source::open` が `SDEV_CREATE` の 1038 で
+  落ちる（1 回/起動 になる）**。18 MiB では通常の取得で埋まらない。
+- 終了処理（`bs2k::Source::drop`）は念のため **まず demodulator の TS 出力を
+  止め**（`quiesce_ts_output`）、ring を drain してから graph を解体する。
+  ring を破棄できなかった場合は明示的にエラーを残す
+  （次回起動が失敗することを隠さない）。
+- `restore_frontend()` は best-effort。この個体は OEM tuner ELF のハッシュが
+  参照ファームと違うため固定アドレス復元が使えず、失敗しても取得成功なら
+  rc=0 のままにする。`--no-restore-frontend` で明示的にスキップできる。
 - 引数は mirakc の Mustache:
   `--type {{{channel_type}}} --channel {{{channel}}} --duration {{{duration}}} -`
 

@@ -349,3 +349,105 @@ DEMUX 構築で 1038 になり、TS は取得できなかった。
   別の復元経路（プロセスメモリを使わない device assign のみ等）を検討する必要がある。
 - BS 取得前に graph/ring を確実に破棄する追加対応も必要。
 - 次のテスト前に再度電源再投入が必要。
+
+## 真因の特定と修正（2026-11-14 03:5x JST）— リブート不要で連続取得に成功
+
+上記の「ring が live のまま残る」の真因を実機で特定した。**原因は DEMUX 出力
+ring のあふれ**であり、cleanup 順序や timeout ではなかった。
+
+### 調査方法
+
+`xcdrv::call` に一時的な env-gated ioctl トレース（`T4S_TRACE_IOCTL=1`）を入れ、
+各 teardown コマンドの戻り値と所要 ms を実測した。
+
+### 観測
+
+fresh boot 直後の **最初**の `Source::open`（CS8, 8 秒）は成功し、TS も
+13.7 MB 取得できた。しかし cleanup で:
+
+```text
+ioctl 0x1f6002a (remove_pid)  err=1038 ms=4979   <- kernel 既定 timeout
+ioctl 0x0009002a (disconnect) err=1038 ms=2939   <- [dev,conn,1,3000]
+ioctl 0x0003002a (stop)       err=1038 ms=1999   <- [dev,1,2000]
+ioctl 0x0003002a (stop)       err=1038 ms=1880
+ioctl 0x0009002a (disconnect) err=1038 ms=2880
+ring status writer=0x1e00ad00 readers=0  → ring は live のまま
+```
+
+- すべて **各 timeout を使い切って 1038 (XCE_TIMEOUT)**。
+- 対照的に **グローバル** TSI コマンド `0x50` / `0x53` と `0x19` / `0x36` は
+  同じタイミングで **すべて ok (ms=0–2)**。→ kernel は生きているが、
+  **per-device (0x2a class) コマンドだけ ARC が応答しない**。
+- 次の `Source::open` は `SDEV_CREATE (0x28)` が **ms=4991 で 1038**。
+
+### 切り分け（fresh boot ごとに1条件）
+
+| 条件 | teardown | 連続 open |
+|---|---|---|
+| 既定 ring 0x6000 / 8 秒取得 | 1038 で全滅、ring live | 2 回目が 1038 |
+| 既定 ring / **1 秒取得 ×5** | **5/5 成功** | **5/5 成功** |
+| 300 ms 遅延のみ | 1038 で全滅 | 2 回目が 1038 |
+| `quiesce` のみ | 不安定（成功も失敗も） | 不安定 |
+| **ring 0x18000 / 8 秒 ×3** | **3/3 成功** | **3/3 成功** |
+
+つまり **取得が長いほど ring があふれ、DEMUX が ring 書き込みで ARC 内に
+ブロックする**。ホスト側の読み出しは約 2 MB/s、フル CS は約 5–7 MB/s なので
+4.6 MiB の既定 ring は数秒で埋まる。1 秒取得や 18 MiB ring では埋まらない。
+
+### 修正
+
+1. `rust/t4s-core/src/xcdrv.rs`: DEMUX 出力 ring を
+   **0x6000 → 0x18000 units (4.6 MiB → 18 MiB)**。（他フィールドは不変）
+2. `rust/t4s-core/src/bs2k.rs`: teardown を整理。**先に demodulator の
+   TS 出力を止めて ring を drain** してから graph を解体する。ring を破棄
+   できなかった場合は `ring ... still present after destroy` を明示的に残し、
+   `cleanup_ok=false` にする（次回起動が失敗することを隠さない）。
+3. `rust/t4s-tuner/src/main.rs`: `--no-restore-frontend` を追加し、
+   `restore_frontend()` を best-effort 化（この個体は OEM ELF 不一致で
+   必ず失敗するため、成功した取得を rc=1 にしない）。
+
+### 検証結果（リブート不要、同一起動内で 3 連続取得）
+
+fresh boot 後、mirakc を起動せず、同一起動のまま:
+
+| 順 | 放送 | 秒 | rc | bytes | 先頭16 | cleanup |
+|---|---:|---:|---:|---:|---|---|
+| 1 | CS8 | 8 | **0** | 31,490,752 | `47 10 0f 1a ...` | 1038 なし / ring 破棄 OK |
+| 2 | BS13_0 | 8 | **0** | 16,088,100 | `47 01 40 fd ...` | 1038 なし / ring 破棄 OK |
+| 3 | CS8 | 8 | **0** | 32,459,704 | `47 10 0d 9c ...` | 1038 なし / ring 破棄 OK |
+
+- 各 run の間は 10 秒。3 回とも bytes>0 / 先頭 `0x47`。
+- cleanup ログ:
+
+```text
+mkra: opened ISDB-S RF 12411000 TSID 6080 / raw (CAS is a separate decode filter)
+mkra: BS2K teardown quiesce 0xc0->0x40
+TSI rollback: configuration MMRs and identity mapping exactly restored
+```
+
+  1038 の行が **1 行も出ていない**。ring live 警告もない。
+- 3 回終了後の graph は **devices count=11**（fresh boot と同じ、残骸なし）。
+  `mmr61f0=0x10`（identity）に復元。
+- rc=0。`frontend restore warning: unrecognised tuner ELF` は出るが
+  best-effort のため rc は 0 のまま。
+
+### ffprobe（host）
+
+```text
+cs8a.ts: mpegts / MPEG-2 Main 1440x1080 29.97fps + AAC LC 48000Hz 2ch
+         program 55（クリア）, program 218（scrambled）
+         188B sync ratio 1.0000
+bs13.ts: mpegts / MPEG-2 + AAC + arib_caption（decode=0 のため映像は scrambled）
+         188B sync ratio 1.0000
+```
+
+CS8 program 55 は 30 フレーム実デコード成功。
+
+### 結論
+
+- **リブート不要で連続取得できる。** 同一起動のまま CS8→BS13_0→CS8 を続けて
+  取得でき、各 teardown も 1038 なしで完了し、graph 残骸も残らない。
+- 真因は cleanup 順序ではなく **DEMUX 出力 ring のサイズ不足**（ホスト読み出し
+  速度 < トランスポンダ速度）。ring を 18 MiB に広げることで解消。
+- `restore_frontend()` はこの個体では依然失敗する（OEM ELF 不一致）が、
+  取得・cleanup の成否とは独立に扱う（best-effort）。

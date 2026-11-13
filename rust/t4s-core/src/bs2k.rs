@@ -25,6 +25,29 @@ fn err(s: impl Into<String>) -> io::Error {
 fn benign_cleanup_error(e: &io::Error) -> bool {
     e.raw_os_error() == Some(1038)
 }
+/// Drain a reader for at most `budget`, stopping after two consecutive empty
+/// reads.  Used by teardown to give a parked ARC write room to finish.
+fn drain(reader: &mut Option<XcReaderSource>, budget: Duration) {
+    let Some(reader) = reader.as_mut() else { return };
+    let until = Instant::now() + budget;
+    let mut total = 0usize;
+    let mut scratch = Vec::with_capacity(64 * 1024);
+    let mut quiet = 0;
+    while Instant::now() < until && quiet < 2 {
+        scratch.clear();
+        match reader.read_into(&mut scratch) {
+            Ok(0) => quiet += 1,
+            Ok(n) => {
+                quiet = 0;
+                total += n;
+            }
+            Err(_) => break,
+        }
+    }
+    if total != 0 {
+        eprintln!("mkra: BS2K teardown drained {total} bytes");
+    }
+}
 fn identity() -> io::Result<()> {
     for (path, want) in [
         ("/usr/bin/tuner", "0416f546e87bd2b0c7a2e764ea0ee292"),
@@ -231,117 +254,120 @@ impl TsSource for Source {
 impl Drop for Source {
     fn drop(&mut self) {
         let mut good = true;
-        let mut check = |label: &str, r: io::Result<()>| {
-            if let Err(e) = r {
-                if benign_cleanup_error(&e) {
-                    eprintln!("mkra: BS2K cleanup {label}: ignored benign error: {e}");
-                } else {
-                    good = false;
-                    eprintln!("mkra: BS2K cleanup {label}: {e}");
+        macro_rules! check {
+            ($label:expr, $r:expr) => {
+                if let Err(e) = $r {
+                    if benign_cleanup_error(&e) {
+                        eprintln!("mkra: BS2K cleanup {}: ignored benign error: {e}", $label);
+                    } else {
+                        good = false;
+                        eprintln!("mkra: BS2K cleanup {}: {e}", $label);
+                    }
                 }
-            }
-        };
+            };
+        }
 
-        // remove_pid sometimes reports 1038 after the reader has already
-        // disappeared.  Retry once before treating it as real.
+        // The ring must be gone before the next `Source::open`, or its
+        // `SDEV_CREATE` returns XCE_TIMEOUT (1038).  The cause is a backed-up
+        // DEMUX output ring: while the ring is full the ARC blocks inside its
+        // write, so every device-control command (remove_pid, disconnect, stop,
+        // destroy) waits for the ARC and times out, and the DEMUX is never
+        // released.  The ring size is raised in `demux_ts_buffer_create_request`
+        // so a normal capture cannot fill it; as a second line of defence,
+        // teardown stops the demodulator's TS output and drains the ring before
+        // touching the graph, which also unblocks a write that is already
+        // parked.
+        match gr_i2c::quiesce_ts_output() {
+            Ok(v) => eprintln!(
+                "mkra: BS2K teardown quiesce 0x{:02x}->0x{:02x}",
+                v.before, v.after
+            ),
+            Err(e) => eprintln!("mkra: BS2K teardown quiesce failed: {e}"),
+        }
+        drain(&mut self.reader, Duration::from_secs(2));
+
+        // Detach the DEMUX from the ring.
         if self.filter {
-            match self.drv.remove_demux_pid(self.device, u32::MAX) {
-                Ok(()) => {}
-                Err(first) => {
-                    eprintln!("mkra: BS2K remove PID retry: {first}");
-                    std::thread::sleep(Duration::from_millis(100));
-                    check(
-                        "remove PID",
-                        self.drv.remove_demux_pid(self.device, u32::MAX),
-                    );
-                }
-            }
+            check!("remove PID", self.drv.remove_demux_pid(self.device, u32::MAX));
         }
         drop(self.reader.take());
         if self.connection != 0 {
-            if let Err(first) = self
+            if let Err(e) = self
                 .drv
                 .disconnect_product_demux(self.device, self.connection)
             {
-                eprintln!("mkra: BS2K disconnect needs stop/retry: {first}");
+                eprintln!("mkra: BS2K teardown disconnect: {e}");
                 if self.running {
-                    match self.drv.stop_device(self.device) {
-                        Ok(()) => self.running = false,
-                        Err(stop_first) => {
-                            eprintln!("mkra: BS2K cleanup stop retry: {stop_first}");
-                            std::thread::sleep(Duration::from_millis(100));
-                            match self.drv.stop_device(self.device) {
-                                Ok(()) => self.running = false,
-                                Err(stop_second) => {
-                                    check("stop retry", Err(stop_second))
-                                }
-                            }
-                        }
-                    }
+                    check!("stop", self.drv.stop_device(self.device));
+                    self.running = false;
                 }
-                std::thread::sleep(Duration::from_millis(100));
-                check(
-                    "disconnect retry",
+                check!(
+                    "disconnect",
                     self.drv
-                        .disconnect_product_demux(self.device, self.connection),
+                        .disconnect_product_demux(self.device, self.connection)
                 );
             }
         }
 
-        // Give the ring writer/readers a short window to disappear.  A live
-        // ring is never destroyed, but the rest of the cleanup still runs.
-        let mut clear = self.buffer == 0;
-        if !clear {
-            clear = self
-                .drv
-                .sbuf_status_raw(self.buffer)
-                .is_ok_and(|s| s[8] == 0 && s[9] == 0);
-            for _ in 0..10 {
-                if clear {
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(100));
+        // Reset and destroy the ring once its writer/readers have cleared.
+        if self.buffer != 0 {
+            let mut clear = false;
+            for _ in 0..40 {
                 clear = self
                     .drv
                     .sbuf_status_raw(self.buffer)
                     .is_ok_and(|s| s[8] == 0 && s[9] == 0);
+                if clear {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(50));
             }
-        }
-        if self.buffer != 0 {
             if clear {
-                check("reset ring", self.drv.force_reset_buffer(self.buffer));
-                check("destroy ring", self.drv.destroy_buffer(self.buffer));
+                check!("reset ring", self.drv.force_reset_buffer(self.buffer));
+                check!("destroy ring", self.drv.destroy_buffer(self.buffer));
+                // A "successful" destroy that leaves the handle queryable means
+                // the ring still exists and the next open will fail.  Say so
+                // instead of implying success.
+                if self.drv.sbuf_status_raw(self.buffer).is_ok() {
+                    good = false;
+                    eprintln!(
+                        "mkra: BS2K cleanup ring {:#x} still present after destroy; \
+                         the next start will fail with os error 1038 until the \
+                         device is rebooted",
+                        self.buffer
+                    );
+                }
             } else {
-                check(
+                check!(
                     "ring ownership",
-                    Err(err("retaining graph with live writer/readers")),
+                    Err::<(), io::Error>(err("retaining graph with live writer/readers"))
                 );
             }
         }
 
-        // Best-effort: every later step runs even when an earlier one failed.
+        // Best-effort: the rest runs even when the ring cleanup failed.
         if self.running {
-            check("stop", self.drv.stop_device(self.device));
+            check!("stop", self.drv.stop_device(self.device));
         }
         if self.device != 0 {
-            check("destroy DEMUX", self.drv.destroy_device(self.device));
+            check!("destroy DEMUX", self.drv.destroy_device(self.device));
         }
         if self.pipeline != 0 {
-            check("stop pipeline", self.drv.stop_pipeline(self.pipeline));
+            check!("stop pipeline", self.drv.stop_pipeline(self.pipeline));
         }
         if self.av != 0 {
-            check("destroy AV_SYNC", self.drv.destroy_device(self.av));
+            check!("destroy AV_SYNC", self.drv.destroy_device(self.av));
         }
         if self.pipeline != 0 {
-            check("destroy pipeline", self.drv.destroy_pipeline(self.pipeline));
+            check!("destroy pipeline", self.drv.destroy_pipeline(self.pipeline));
         }
         if let Some(req) = self.restore_physical.take() {
-            check(
+            check!(
                 "restore physical TSI1",
-                self.drv.configure_physical_tsi_request(&req),
+                self.drv.configure_physical_tsi_request(&req)
             );
         } else if let Some(mapping) = self.mapping.take() {
-            check("restore TSI", self.drv.restore_tsi_mapping(&mapping));
+            check!("restore TSI", self.drv.restore_tsi_mapping(&mapping));
         }
         if !good {
             self.dirty.store(true, Ordering::SeqCst);

@@ -47,7 +47,7 @@ fn install_signal_handlers() {
 
 fn usage() -> ! {
     eprintln!(
-        "usage: t4s-tuner --type BS|CS|BS4K --channel <value> [--duration <sec|->] [--device <path>] [--freq <kHz>] -"
+        "usage: t4s-tuner --type BS|CS|BS4K --channel <value> [--duration <sec|->] [--device <path>] [--freq <kHz>] [--no-restore-frontend] -"
     );
     eprintln!("env: T4S_CS_TSI_PORT=<n>  physical TSI port for CS (default 0)");
     eprintln!("     T4S_CS_NATIVE_TSI=1   legacy CS native TSI0 route (no remap)");
@@ -61,6 +61,7 @@ struct Args {
     duration: Option<Duration>,
     device: String,
     freq_override: Option<u32>,
+    restore_frontend: bool,
 }
 
 fn parse_args() -> Args {
@@ -70,6 +71,7 @@ fn parse_args() -> Args {
     let mut duration = None;
     let mut device = xcdrv::DEV_PATH.to_string();
     let mut freq_override = None;
+    let mut restore_frontend = true;
     while let Some(a) = it.next() {
         match a.as_str() {
             "--type" | "--channel-type" => channel_type = it.next(),
@@ -83,6 +85,7 @@ fn parse_args() -> Args {
             }
             "--device" => device = it.next().unwrap_or(device),
             "--freq" => freq_override = it.next().and_then(|v| v.parse().ok()),
+            "--no-restore-frontend" => restore_frontend = false,
             "-" => {}
             "--help" | "-h" => usage(),
             other => {
@@ -100,6 +103,7 @@ fn parse_args() -> Args {
         duration,
         device,
         freq_override,
+        restore_frontend,
     }
 }
 
@@ -321,14 +325,20 @@ fn run_2k(args: &Args, deadline: Option<Instant>) -> Result<(), String> {
     if dirty.load(Ordering::SeqCst) {
         eprintln!("t4s-tuner: graph cleanup incomplete (best-effort)");
     }
-    // Always hand the frontend back to the product so a following BS4K
-    // request can acquire its ADBS package.  Cleanup errors above must not
-    // prevent this.
+    // Hand the frontend back to the product so a following BS4K request can
+    // acquire its ADBS package.  This is best-effort: on this unit the OEM
+    // tuner ELF hashes differ from the reference firmware, so the fixed-address
+    // restore cannot run at all.  A failed restore must not turn a successful
+    // capture into rc=1; `--no-restore-frontend` skips it outright.
+    if !args.restore_frontend {
+        eprintln!("t4s-tuner: frontend restore skipped (--no-restore-frontend)");
+        return result;
+    }
     match bs2k::restore_frontend() {
         Ok(()) => result,
         Err(e) => {
             eprintln!("t4s-tuner: frontend restore warning: {e}");
-            Err(format!("frontend restore failed: {e}"))
+            result
         }
     }
 }

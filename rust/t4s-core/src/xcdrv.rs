@@ -256,10 +256,20 @@ const fn av_sync_live_mode_request(av_sync: u32) -> [u32; 8] {
 ///
 /// SYSTEM/TS is accepted by the ARC `get_pid_filter_output_type` switch and
 /// maps to output type 0.  For RING buffers `m_size` is a count of units, not
-/// bytes: the measured 0x6000 units * 188 bytes produces a 0x468000-byte ring.
-/// Passing 0x468000 here asks for 868,614,144 bytes and returns XCE_NO_MORE.
+/// bytes.  Passing a byte count here asks for a gigantic ring and returns
+/// XCE_NO_MORE.
+///
+/// The product's own value is 0x6000 units (4.6 MiB).  That is too small for a
+/// host reader on this box: the read loop drains at roughly 2 MB/s while a
+/// full CS transponder delivers ~5-7 MB/s, so the ring fills within a few
+/// seconds, the ARC blocks inside its write to it, and every later
+/// device-control command (remove_pid, disconnect, stop, destroy) returns
+/// XCE_TIMEOUT (1038) -- the DEMUX is never released and the next
+/// `Source::open` dies in `SDEV_CREATE`.  A 4x ring (0x18000 units, 18 MiB)
+/// gives enough slack that a normal capture never fills it; measured, three
+/// back-to-back 8 s captures then all clean up and reopen successfully.
 const fn demux_ts_buffer_create_request() -> [u32; 9] {
-    [3, 1, 2, 1, 0x1000, 0x6000, 188, 3, 0]
+    [3, 1, 2, 1, 0x1000, 0x18000, 188, 3, 0]
 }
 
 /// Product PAT/PMT section ring from `Dxd_AllocateSecFilter`.
@@ -1646,9 +1656,11 @@ mod tests {
     fn demux_full_ts_ring_is_system_ts() {
         assert_eq!(
             demux_ts_buffer_create_request(),
-            [3, 1, 2, 1, 0x1000, 0x6000, 188, 3, 0]
+            [3, 1, 2, 1, 0x1000, 0x18000, 188, 3, 0]
         );
-        assert_eq!(0x6000u32 * 188, 0x468000);
+        // Only the unit count differs from the product's 0x6000; the rest of the
+        // request (RING / SYSTEM / TS, one reader, flags 3) is unchanged.
+        assert_eq!(0x18000u32 * 188, 18_481_152);
     }
 
     #[test]
