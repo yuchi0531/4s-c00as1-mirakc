@@ -55,6 +55,7 @@ pub fn legacy_frontend() -> io::Result<bool> {
 pub struct Source {
     drv: Arc<XcDrv>,
     mapping: Option<TsiMappingSnapshot>,
+    restore_physical: Option<[u32; 10]>,
     pipeline: u32,
     av: u32,
     device: u32,
@@ -78,6 +79,8 @@ impl Source {
         freq: u32,
         tsid: u16,
         service_id: u16,
+        check_tsid: bool,
+        physical_port: u32,
         legacy: &AtomicBool,
         dirty: Arc<AtomicBool>,
     ) -> io::Result<Self> {
@@ -97,9 +100,11 @@ impl Source {
             Some(Decoder::new(card, system, iv, tsid).select_service(service_id))
         };
         let mapping = drv.snapshot_tsi_mapping()?;
+        let restore_physical = if physical_port == 1 { mapping.request(1) } else { None };
         let mut source = Self {
             drv,
             mapping: Some(mapping),
+            restore_physical,
             pipeline: 0,
             av: 0,
             device: 0,
@@ -134,7 +139,7 @@ impl Source {
             // TSID 0 means "unspecified" (CS).  In that case only the lock
             // and output framing are checked; the decoder learns the real
             // TSID from the first PAT.
-            let tsid_ok = tsid == 0 || r.bank2_selection[..2] == tsid.to_be_bytes();
+            let tsid_ok = !check_tsid || tsid == 0 || r.bank2_selection[..2] == tsid.to_be_bytes();
             if r.lock & 0x20 != 0
                 && tsid_ok
                 && r.bank0.iter().any(|&(r, v)| r == 0xcc && v & 0x80 != 0)
@@ -152,8 +157,14 @@ impl Source {
         source.pipeline = source.drv.create_pipeline()?;
         source.av = source.drv.create_av_sync()?;
         source.drv.set_pipeline(source.av, source.pipeline)?;
-        source.drv.configure_product_mpeg_ts_tsi(0)?;
-        source.drv.map_tsi_one_to_zero()?;
+        if physical_port == 0 {
+            source.drv.configure_product_mpeg_ts_tsi(0)?;
+            source.drv.map_tsi_one_to_zero()?;
+        } else {
+            // 110°CS comes out on physical TSI1; logical TSI1 is already
+            // mapped to it by the identity configuration.
+            source.drv.configure_physical_tsi_packet(1, 188)?;
+        }
         source.drv.set_av_sync_live_mode(source.av)?;
         source.device = source.drv.create_mpeg_ts_demux()?;
         source.drv.set_pipeline(source.device, source.pipeline)?;
@@ -270,7 +281,12 @@ impl Drop for Source {
             check("destroy pipeline", self.drv.destroy_pipeline(self.pipeline));
         }
         if clear {
-            if let Some(mapping) = self.mapping.take() {
+            if let Some(req) = self.restore_physical.take() {
+                check(
+                    "restore physical TSI1",
+                    self.drv.configure_physical_tsi_request(&req),
+                );
+            } else if let Some(mapping) = self.mapping.take() {
                 check("restore TSI", self.drv.restore_tsi_mapping(&mapping));
             }
         }

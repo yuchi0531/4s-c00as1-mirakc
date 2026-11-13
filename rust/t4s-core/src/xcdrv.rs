@@ -122,6 +122,12 @@ pub struct TsiMappingSnapshot {
     requests: [[u32; 10]; 2],
 }
 
+impl TsiMappingSnapshot {
+    pub fn request(&self, port: usize) -> Option<[u32; 10]> {
+        self.requests.get(port).copied()
+    }
+}
+
 fn decode_physical_tsi(port: u32, registers: [u32; 3]) -> io::Result<[u32; 10]> {
     if port > 1 { return Err(io::Error::other("snapshot supports physical TSI0/1 only")); }
     let [control, electrical, drop] = registers;
@@ -1053,6 +1059,34 @@ impl XcDrv {
         Ok(())
     }
 
+    /// Recover the logical-TSI identity mapping without a reboot.
+    ///
+    /// A failed 2K session can leave `0x61f0 == 0` (logical TSI1 remapped to
+    /// physical TSI0).  `snapshot_tsi_mapping` refuses that state, so every
+    /// later tuner open fails until the box is power-cycled.  This rebuilds a
+    /// rollback image from the *current* physical registers and restores the
+    /// identity mapping.  It does not invent a 4K configuration; a later 4K
+    /// tune must let the product rebuild its own TSI0.
+    pub fn restore_tsi_identity_from_current(&self) -> io::Result<()> {
+        let registers = [self.mmr_read32(0x6000)?, self.mmr_read32(0x6008)?, self.mmr_read32(0x600c)?];
+        let snapshot = TsiMappingSnapshot {
+            registers,
+            requests: [
+                decode_physical_tsi(0, registers)?,
+                decode_physical_tsi(1, registers)?,
+            ],
+        };
+        self.restore_tsi_mapping(&snapshot)
+    }
+
+    /// Apply a decoded physical TSI request verbatim (used to restore a
+    /// physical port that was overwritten without a logical remap).
+    pub fn configure_physical_tsi_request(&self, request: &[u32; 10]) -> io::Result<()> {
+        let mut req = *request;
+        unsafe { self.call(TSI_CONFIG, &mut req)? };
+        Ok(())
+    }
+
     pub fn restore_tsi_mapping(&self, saved: &TsiMappingSnapshot) -> io::Result<()> {
         let current = self.mmr_read32(0x61f0)?;
         if !matches!(current, 0 | 0x10) {
@@ -1136,6 +1170,23 @@ impl XcDrv {
         let mut req = product_demux_run_request(device);
         log_raw_words("DEMUX run request", &req);
         unsafe { self.call(SDEV_RUN, &mut req)? };
+        Ok(())
+    }
+
+    /// Same as `disconnect_product_demux`, but with a caller-chosen timeout.
+    /// A wedged DEMUX can take longer than the product's 2 s default to drain.
+    pub fn disconnect_product_demux_timeout(&self, device: u32, connection: u32, ms: u32) -> io::Result<()> {
+        let mut req = product_demux_disconnect_request(device, connection);
+        if req.len() >= 4 {
+            req[3] = ms;
+        }
+        unsafe { self.call(SDEV_DISCONNECT, &mut req)? };
+        Ok(())
+    }
+
+    pub fn stop_device_timeout(&self, device: u32, ms: u32) -> io::Result<()> {
+        let mut req = [device, 1, ms];
+        unsafe { self.call(SDEV_STOP, &mut req)? };
         Ok(())
     }
 

@@ -277,6 +277,11 @@ fn run_2k(args: &Args, deadline: Option<Instant>) -> Result<(), String> {
         tsid,
         // 0 = raw.  CAS/MULTI2 belongs to t4s-cas, not to the tuner.
         0,
+        // CS locks reliably, but this demod does not expose the PAT TSID in
+        // bank2 for CS.  Keep the real TSID in the FED request, skip the
+        // bank2 equality check so the open can proceed.
+        args.channel_type.eq_ignore_ascii_case("BS"),
+        if args.channel_type.eq_ignore_ascii_case("CS") { 1 } else { 0 },
         &AtomicBool::new(legacy),
         Arc::clone(&dirty),
     )

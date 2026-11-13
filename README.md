@@ -17,7 +17,7 @@ mirakc (Alpine chroot, USB)
 | 放送 | 経路 | 状態 |
 |---|---|---|
 | BS 2K (ISDB-S, MPEG-TS) | `t4s-tuner` が生 TS、`t4s-cas` が本体 CAS で MULTI2 復号 | 実機で復号・映像確認済み（mirakc API 15s / 38.99MB / MPEG-2 1440x1080 + AAC） |
-| CS 2K | 同上（実 TSID を FED に渡す） | TSID を .111 の PAT から実測し `isdbs.rs` に反映。mirakc の CS チャンネル登録は `/api/channels` 停止のため未投入 |
+| CS 2K | 同上（実 TSID を FED に渡す） | mirakc 登録 OK（12局）。RF lock まで到達するが TSI/DEMUX 出力 0 バイト。詳細は docs/CS-STATUS.md |
 | BS4K (ISDB-S3, MMT/TLV) | 本体 ACAS が復号済みの ES を XCode6 REMUX で MPEG-TS 化 | 本体が視聴（LED 緑）状態のときのみ。HDMI 無しでは本体がデコードを開始しない |
 
 BS4K の詳細と制約は [docs/4K-NO-HDMI.md](docs/4K-NO-HDMI.md) を参照してください。

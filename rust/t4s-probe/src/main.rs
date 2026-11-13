@@ -53,8 +53,152 @@ fn graph_dump(drv: &Arc<XcDrv>) {
 fn main() {
     let arg = std::env::args().nth(1).unwrap_or_default();
     let drv = Arc::new(XcDrv::open_path(t4s_core::xcdrv::DEV_PATH).expect("driver"));
+    if arg == "cleanup2" {
+        let dev = 0xdu32;
+        let conn = 0x1e009700u32;
+        let buf = 0x28d66f00u32;
+        for i in 0..3 {
+            match drv.disconnect_product_demux_timeout(dev, conn, 10000) {
+                Ok(()) => println!("disconnect {i} ok"),
+                Err(e) => println!("disconnect {i} ERR {e}"),
+            }
+            match drv.stop_device_timeout(dev, 10000) {
+                Ok(()) => println!("stop {i} ok"),
+                Err(e) => println!("stop {i} ERR {e}"),
+            }
+        }
+        match drv.force_reset_buffer(buf) {
+            Ok(()) => println!("reset ok"),
+            Err(e) => println!("reset ERR {e}"),
+        }
+        match drv.destroy_buffer(buf) {
+            Ok(()) => println!("destroy buf ok"),
+            Err(e) => println!("destroy buf ERR {e}"),
+        }
+        match drv.destroy_device(dev) {
+            Ok(()) => println!("destroy dev ok"),
+            Err(e) => println!("destroy dev ERR {e}"),
+        }
+        return;
+    }
+    if arg == "cleanup" {
+        // Remove only graph objects created by our failed tuner sessions.
+        let g = t4s_core::graph::Graph::read().expect("graph");
+        let product_pipes: std::collections::BTreeSet<u32> = g
+            .tables
+            .get("device")
+            .unwrap()
+            .2
+            .iter()
+            .filter(|r| r.words[0] <= 0xb)
+            .map(|r| r.words[2])
+            .filter(|&p| p != 0)
+            .collect();
+        let leaked: Vec<(u32, u32)> = g
+            .tables
+            .get("device")
+            .unwrap()
+            .2
+            .iter()
+            .filter(|r| r.words[0] != 0 && r.words[0] > 0xb && !product_pipes.contains(&r.words[2]))
+            .map(|r| (r.words[0], r.words[2]))
+            .collect();
+        let ports = &g.tables.get("port").unwrap().2;
+        let buffers: Vec<u32> = g
+            .tables
+            .get("buffer")
+            .unwrap()
+            .2
+            .iter()
+            .map(|r| r.words[0])
+            .filter(|&h| h >= 0x1f00_0000)
+            .collect();
+        println!("product_pipes={product_pipes:?} leaked={leaked:?} buffers={buffers:#x?}");
+        for &(dev, _) in &leaked {
+            for r in ports {
+                if r.words[1] == 0x0b {
+                    // host connection: [reader, 0x0b, buffer, 0, 0]
+                    let reader = r.words[0];
+                    let _ = drv.cancel_get_read(reader);
+                    match drv.destroy_reader(reader) {
+                        Ok(()) => println!("destroy_reader {reader:#x} ok"),
+                        Err(e) => println!("destroy_reader {reader:#x} ERR {e}"),
+                    }
+                }
+                if r.words[1] == 1 && r.words[2] == dev {
+                    let conn = r.words[0];
+                    match drv.disconnect(dev, conn) {
+                        Ok(()) => println!("disconnect dev {dev:#x} conn {conn:#x} ok"),
+                        Err(e) => println!("disconnect dev {dev:#x} conn {conn:#x} ERR {e}"),
+                    }
+                }
+            }
+            match drv.stop_device(dev) {
+                Ok(()) => println!("stop dev {dev:#x} ok"),
+                Err(e) => println!("stop dev {dev:#x} ERR {e}"),
+            }
+            match drv.destroy_device(dev) {
+                Ok(()) => println!("destroy dev {dev:#x} ok"),
+                Err(e) => println!("destroy dev {dev:#x} ERR {e}"),
+            }
+        }
+        for &b in &buffers {
+            match drv.force_reset_buffer(b) {
+                Ok(()) => println!("reset buf {b:#x} ok"),
+                Err(e) => println!("reset buf {b:#x} ERR {e}"),
+            }
+            match drv.destroy_buffer(b) {
+                Ok(()) => println!("destroy buf {b:#x} ok"),
+                Err(e) => println!("destroy buf {b:#x} ERR {e}"),
+            }
+        }
+        let mut pipes = std::collections::BTreeSet::new();
+        for &(_, p) in &leaked {
+            if p != 0 && !product_pipes.contains(&p) {
+                pipes.insert(p);
+            }
+        }
+        for p in pipes {
+            match drv.stop_pipeline(p) {
+                Ok(()) => println!("stop pipe {p:#x} ok"),
+                Err(e) => println!("stop pipe {p:#x} ERR {e}"),
+            }
+            match drv.destroy_pipeline(p) {
+                Ok(()) => println!("destroy pipe {p:#x} ok"),
+                Err(e) => println!("destroy pipe {p:#x} ERR {e}"),
+            }
+        }
+        return;
+    }
+    if arg == "restore-tsi" {
+        println!("before 61f0={:#x}", drv.mmr_read32(0x61f0).unwrap_or(0));
+        match drv.restore_tsi_identity_from_current() {
+            Ok(()) => println!("restored 61f0={:#x}", drv.mmr_read32(0x61f0).unwrap_or(0)),
+            Err(e) => println!("restore ERR {e}"),
+        }
+        return;
+    }
     if arg == "graph" {
         graph_dump(&drv);
+        return;
+    }
+    if arg == "fed2k" {
+        let drv = Arc::new(XcDrv::open_path(t4s_core::xcdrv::DEV_PATH).expect("driver"));
+        let rf: u32 = std::env::args().nth(2).and_then(|v| v.parse().ok()).unwrap_or(12_291_000);
+        let tsid: u16 = std::env::args().nth(3).and_then(|v| v.parse().ok()).unwrap_or(0);
+        let fem = tuner::Tuner::open(tuner::MSGH_LIST).expect("fem");
+        fem.set_device(&tuner::FemDeviceRequest::assign(1, 2)).expect("assign 2K");
+        std::thread::sleep(Duration::from_millis(300));
+        let req = tuner::FedTuneRequest::isdb_s(1, tsid, rf).expect("req");
+        let t = tuner::Tuner::open_qid(req.fed_qid, tuner::MSGH_LIST).expect("fed queue");
+        t.tune_fed(&req).expect("tune");
+        std::thread::sleep(Duration::from_secs(2));
+        match t4s_core::gr_i2c::read_isdbs_status() {
+            Ok(v) => println!("fed2k rf={rf} tsid={tsid:#06x} lock={} ts_pin={} ts_serial={}", v.lock, v.ts_pin, v.ts_serial),
+            Err(e) => println!("fed2k status ERR {e}"),
+        }
+        println!("tsi0={:?}", drv.tsi_status(0));
+        println!("tsi1={:?}", drv.tsi_status(1));
         return;
     }
     if arg == "isdbs" {
