@@ -104,11 +104,26 @@ key 0x00C, type 0 → 2 秒待ち → /api/status の SI を確認
 | BSテレ東4K | 171 | 29,367,104 | 8.141 s | 28.86 Mbps | hevc Main 10 3840x2160 | aac_latm LC 48 kHz 2ch |
 | BSフジ4K | 181 | 28,578,632 | 8.459 s | 27.03 Mbps | hevc Main 10 3840x2160 | aac_latm LC 48 kHz 2ch |
 
-- BSP4K の色情報: `color_space=bt2020nc`, `color_transfer=bt2020-10`,
-  `color_primaries=bt2020`, `color_range=tv`, `level=153`。
-  （その番組は HLG (`arib-std-b67`) ではなく BT.2020 10-bit と報告された）
+### 4.1 色情報（全 6 局）
+
+| 局 | color_space | color_transfer | color_primaries |
+|---|---|---|---|
+| BSP4K (101) | bt2020nc | bt2020-10 | bt2020 |
+| BS日テレ4K (141) | bt2020nc | **arib-std-b67 (HLG)** | bt2020 |
+| BS朝日4K (151) | bt2020nc | arib-std-b67 | bt2020 |
+| BS-TBS4K (161) | bt2020nc | arib-std-b67 | bt2020 |
+| BSテレ東4K (171) | bt2020nc | arib-std-b67 | bt2020 |
+| BSフジ4K (181) | bt2020nc | arib-std-b67 | bt2020 |
+
+- 141 は再取得（22:04、`--duration 12`）でも HLG を確認:
+  **37,779,352 bytes / 10.377 s / 29.13 Mbps / hevc Main10 3840x2160 /
+  arib-std-b67 / bt2020nc / aac_latm LC 48 kHz 2ch**。
+- 最初の BSP4K 取得時だけ `bt2020-10` だったのは、その番組が HLG では
+  なかった（または SPS の色記述が BT.2020 10-bit だった）ため。
 - 実尺が `--duration` より短いのは、ring 検出から読み出し開始までの遅れと、
-  12 秒指定時の停止処理によるもの。
+  停止処理によるもの。
+- 取得 TS は先頭が GOP 途中から始まることがあり、ffmpeg デコードでは
+  最初の IDR まで参照エラーが出ることがある（TS 自体は有効）。
 
 ---
 
