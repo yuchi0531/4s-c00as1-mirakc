@@ -194,3 +194,75 @@ TS 自体は取得できているが、graph cleanup に失敗して frontend �
 次の選局前に状態確認（必要なら再起動）が必要。
 
 mirakc は停止状態を維持。キー送信・0x6004・電源操作は行っていない。
+
+## CS remap 既定化と cleanup 修正（2026-11-14 01:33 JST）
+
+### 実装
+
+`rust/t4s-tuner/src/main.rs`:
+
+- CS の既定を **`(physical=T4S_CS_TSI_PORT or 0, logical=1, remap=true)`** に変更
+  （BS と同じ remap 経路）。
+- 旧 native 経路 `(port, 0, false)` は `T4S_CS_NATIVE_TSI=1` で選択。
+- `T4S_CS_TSI_PORT` は物理ポート指定として維持。
+- `T4S_CS_REMAP` は後方互換のため受理（remap が既定なので実質 no-op）。
+- usage に環境変数を追記。
+
+`rust/t4s-core/src/bs2k.rs`:
+
+- `Drop` の cleanup を best-effort 化。
+- `No error information (os error 1038)` は remove PID / stop / disconnect の
+  再試行後に benign として無視。
+- remove PID / stop / disconnect を 1 回再試行。
+- ring が live の場合は最大 10 × 100 ms 待ってから判定。
+- ring が live でも後続の stop / destroy / pipeline cleanup / TSI restore を続行。
+- `graph cleanup failed; refusing to restore the frontend` を廃止。
+- `restore_frontend()` は常に呼ぶ。TS 取得成功 + frontend 復元成功なら rc=0、
+  復元失敗時のみ rc=1。
+
+ビルド・配置:
+
+```text
+t4s-tuner: 552,388 bytes, md5 01cfa56831ff28cfc6c0a05ecb8e90ed
+実機 /mnt/t4s/opt/t4s/bin/t4s-tuner と md5 一致、755
+mirakc は停止したまま
+```
+
+### 状態確認と復旧
+
+前回の remap 成功後、`0x61f0` は `0x0`（logical TSI1 → physical TSI0 の
+remap が残存）で、`snapshot_tsi_mapping` が拒否する状態だった。
+
+```text
+t4s-probe isdbs: lock=103, bank2=[96,128,0] (CS8/TSID 0x6080)
+t4s-probe restore-tsi: before 61f0=0x0 -> restored 61f0=0x10
+```
+
+TSI mapping は復旧したが、前回の cleanup 失敗で graph の残骸は残っていた。
+
+### 新既定での CS テスト
+
+```sh
+t4s-tuner --type CS --channel CS8 --duration 8 - > /tmp/cs8.ts 2> /tmp/cs8.log
+```
+
+- **rc=1 / 0 bytes / 0x47 なし**
+- ログ:
+
+```text
+physical TSI config request ...
+logical TSI1 to physical TSI0 config_ex ...
+restore logical TSI1 identity and physical TSI1 ...
+TSI rollback: configuration MMRs and identity mapping exactly restored
+t4s-tuner: ISDB-S open: No error information (os error 1038)
+```
+
+`Source::open` の remap 設定後、DEMUX 構築中に 1038 で失敗した。
+TSI rollback は実行されたが、前回の graph 残骸が残っているため、
+**この状態では新 cleanup 経路を正常系で検証できない**。
+BS テストは実施せず、追加のキー送信・0x6004 も行っていない。
+
+### 次に必要
+
+**要・電源再投入**。再起動後に graph が初期化された状態で、
+CS 既定（remap）と BS を 10 秒間隔で再テストする。

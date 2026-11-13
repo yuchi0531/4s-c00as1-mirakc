@@ -26,6 +26,9 @@ mirakc は USB 上の ext4 イメージ内の Alpine rootfs で動きます。
   ES リングが揃ったら REMUX を組み立てて 188 バイト TS を stdout へ出す。
 - `--type BS|CS --channel BSxx_y|CSn`: FED に直接選局し、DEMUX の生 TS を stdout へ出す。
   **復号はしない**（scrambling フラグはそのまま）。
+  CS も BS と同じ logical TSI1 → physical TSI0 remap を既定で使う。
+  旧 native 経路は `T4S_CS_NATIVE_TSI=1`、物理ポートは `T4S_CS_TSI_PORT` で指定。
+  終了時は cleanup が一部失敗しても `restore_frontend()` を必ず実行する。
 - 引数は mirakc の Mustache:
   `--type {{{channel_type}}} --channel {{{channel}}} --duration {{{duration}}} -`
 

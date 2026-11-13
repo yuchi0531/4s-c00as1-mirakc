@@ -19,6 +19,12 @@ use std::{
 fn err(s: impl Into<String>) -> io::Error {
     io::Error::other(s.into())
 }
+/// The vendor driver reports 1038 ("No error information") when a reader/PID
+/// has already disappeared.  It is cleanup noise, not a reason to skip the
+/// frontend restore.
+fn benign_cleanup_error(e: &io::Error) -> bool {
+    e.raw_os_error() == Some(1038)
+}
 fn identity() -> io::Result<()> {
     for (path, want) in [
         ("/usr/bin/tuner", "0416f546e87bd2b0c7a2e764ea0ee292"),
@@ -227,15 +233,29 @@ impl Drop for Source {
         let mut good = true;
         let mut check = |label: &str, r: io::Result<()>| {
             if let Err(e) = r {
-                good = false;
-                eprintln!("mkra: BS2K cleanup {label}: {e}");
+                if benign_cleanup_error(&e) {
+                    eprintln!("mkra: BS2K cleanup {label}: ignored benign error: {e}");
+                } else {
+                    good = false;
+                    eprintln!("mkra: BS2K cleanup {label}: {e}");
+                }
             }
         };
+
+        // remove_pid sometimes reports 1038 after the reader has already
+        // disappeared.  Retry once before treating it as real.
         if self.filter {
-            check(
-                "remove PID",
-                self.drv.remove_demux_pid(self.device, u32::MAX),
-            );
+            match self.drv.remove_demux_pid(self.device, u32::MAX) {
+                Ok(()) => {}
+                Err(first) => {
+                    eprintln!("mkra: BS2K remove PID retry: {first}");
+                    std::thread::sleep(Duration::from_millis(100));
+                    check(
+                        "remove PID",
+                        self.drv.remove_demux_pid(self.device, u32::MAX),
+                    );
+                }
+            }
         }
         drop(self.reader.take());
         if self.connection != 0 {
@@ -245,9 +265,21 @@ impl Drop for Source {
             {
                 eprintln!("mkra: BS2K disconnect needs stop/retry: {first}");
                 if self.running {
-                    check("stop retry", self.drv.stop_device(self.device));
-                    self.running = false;
+                    match self.drv.stop_device(self.device) {
+                        Ok(()) => self.running = false,
+                        Err(stop_first) => {
+                            eprintln!("mkra: BS2K cleanup stop retry: {stop_first}");
+                            std::thread::sleep(Duration::from_millis(100));
+                            match self.drv.stop_device(self.device) {
+                                Ok(()) => self.running = false,
+                                Err(stop_second) => {
+                                    check("stop retry", Err(stop_second))
+                                }
+                            }
+                        }
+                    }
                 }
+                std::thread::sleep(Duration::from_millis(100));
                 check(
                     "disconnect retry",
                     self.drv
@@ -255,11 +287,26 @@ impl Drop for Source {
                 );
             }
         }
-        let clear = self.buffer == 0
-            || self
+
+        // Give the ring writer/readers a short window to disappear.  A live
+        // ring is never destroyed, but the rest of the cleanup still runs.
+        let mut clear = self.buffer == 0;
+        if !clear {
+            clear = self
                 .drv
                 .sbuf_status_raw(self.buffer)
                 .is_ok_and(|s| s[8] == 0 && s[9] == 0);
+            for _ in 0..10 {
+                if clear {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+                clear = self
+                    .drv
+                    .sbuf_status_raw(self.buffer)
+                    .is_ok_and(|s| s[8] == 0 && s[9] == 0);
+            }
+        }
         if self.buffer != 0 {
             if clear {
                 check("reset ring", self.drv.force_reset_buffer(self.buffer));
@@ -271,30 +318,30 @@ impl Drop for Source {
                 );
             }
         }
+
+        // Best-effort: every later step runs even when an earlier one failed.
         if self.running {
             check("stop", self.drv.stop_device(self.device));
         }
-        if self.device != 0 && clear {
+        if self.device != 0 {
             check("destroy DEMUX", self.drv.destroy_device(self.device));
         }
-        if self.pipeline != 0 && clear {
+        if self.pipeline != 0 {
             check("stop pipeline", self.drv.stop_pipeline(self.pipeline));
         }
-        if self.av != 0 && clear {
+        if self.av != 0 {
             check("destroy AV_SYNC", self.drv.destroy_device(self.av));
         }
-        if self.pipeline != 0 && clear {
+        if self.pipeline != 0 {
             check("destroy pipeline", self.drv.destroy_pipeline(self.pipeline));
         }
-        if clear {
-            if let Some(req) = self.restore_physical.take() {
-                check(
-                    "restore physical TSI1",
-                    self.drv.configure_physical_tsi_request(&req),
-                );
-            } else if let Some(mapping) = self.mapping.take() {
-                check("restore TSI", self.drv.restore_tsi_mapping(&mapping));
-            }
+        if let Some(req) = self.restore_physical.take() {
+            check(
+                "restore physical TSI1",
+                self.drv.configure_physical_tsi_request(&req),
+            );
+        } else if let Some(mapping) = self.mapping.take() {
+            check("restore TSI", self.drv.restore_tsi_mapping(&mapping));
         }
         if !good {
             self.dirty.store(true, Ordering::SeqCst);

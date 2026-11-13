@@ -49,6 +49,9 @@ fn usage() -> ! {
     eprintln!(
         "usage: t4s-tuner --type BS|CS|BS4K --channel <value> [--duration <sec|->] [--device <path>] [--freq <kHz>] -"
     );
+    eprintln!("env: T4S_CS_TSI_PORT=<n>  physical TSI port for CS (default 0)");
+    eprintln!("     T4S_CS_NATIVE_TSI=1   legacy CS native TSI0 route (no remap)");
+    eprintln!("     T4S_CS_REMAP=1        deprecated; CS remap is the default");
     std::process::exit(2)
 }
 
@@ -275,18 +278,20 @@ fn run_2k(args: &Args, deadline: Option<Instant>) -> Result<(), String> {
     let native_tsi = std::env::var("T4S_NATIVE_TSI").is_ok();
     // (physical TSI port, logical TSI port, use logical1->physical0 remap)
     let (physical_port, logical_port, remap) = if is_cs {
-        // Product 2K route: physical TSI1 -> logical TSI0 by default.
-        // T4S_CS_TSI_PORT=0 is a diagnostic for the alternate physical port.
-        // T4S_CS_REMAP=1 reuses the BS route: physical TSI -> logical TSI1
-        // with the logical1->physical0 remap.
+        // CS uses the same remap path as BS by default:
+        // physical TSI -> logical TSI1 with logical1->physical0 remap.
+        // T4S_CS_TSI_PORT selects the physical port (default 0).
+        // T4S_CS_NATIVE_TSI=1 keeps the old native path
+        // (logical TSI0, no remap).  T4S_CS_REMAP is still accepted for
+        // backward compatibility but remap is now the default.
         let port = std::env::var("T4S_CS_TSI_PORT")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(0);
-        if std::env::var("T4S_CS_REMAP").is_ok() {
-            (port, 1, true)
-        } else {
+        if std::env::var("T4S_CS_NATIVE_TSI").is_ok() {
             (port, 0, false)
+        } else {
+            (port, 1, true)
         }
     } else if native_tsi {
         (0, 0, false)
@@ -314,12 +319,16 @@ fn run_2k(args: &Args, deadline: Option<Instant>) -> Result<(), String> {
     );
     let result = pump(source, deadline).map_err(|e| format!("ISDB-S stream: {e}"));
     if dirty.load(Ordering::SeqCst) {
-        return Err("graph cleanup failed; refusing to restore the frontend".into());
+        eprintln!("t4s-tuner: graph cleanup incomplete (best-effort)");
     }
-    // Hand the frontend back to the product so a following BS4K request can
-    // acquire its ADBS package.
-    if let Err(e) = bs2k::restore_frontend() {
-        eprintln!("t4s-tuner: frontend restore warning: {e}");
+    // Always hand the frontend back to the product so a following BS4K
+    // request can acquire its ADBS package.  Cleanup errors above must not
+    // prevent this.
+    match bs2k::restore_frontend() {
+        Ok(()) => result,
+        Err(e) => {
+            eprintln!("t4s-tuner: frontend restore warning: {e}");
+            Err(format!("frontend restore failed: {e}"))
+        }
     }
-    result
 }
