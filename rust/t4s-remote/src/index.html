@@ -1,0 +1,423 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>4S-C00AS1 Remote</title>
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #0b0f14;
+    --panel: #141b24;
+    --panel-edge: #263241;
+    --text: #e7edf5;
+    --muted: #8fa2b8;
+    --accent: #3d6cff;
+    --ok: #35c98a;
+    --err: #ff6060;
+    --key: #223041;
+    --key-edge: #31465e;
+    --key-hi: #2d4054;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--bg); color: var(--text); }
+  body {
+    font: 15px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", "Hiragino Sans",
+          "Noto Sans JP", Roboto, sans-serif;
+    padding: 14px 14px 40px;
+    -webkit-tap-highlight-color: transparent;
+  }
+  header {
+    display: flex; flex-wrap: wrap; gap: 10px; align-items: center;
+    justify-content: space-between; margin: 0 0 14px;
+  }
+  h1 { font-size: 19px; margin: 0; letter-spacing: .02em; }
+  h1 span { color: var(--muted); font-weight: 500; }
+  .head-tools { display: flex; gap: 8px; align-items: center; }
+  .pill {
+    font-size: 12px; color: var(--muted); background: #101720;
+    border: 1px solid var(--panel-edge); border-radius: 999px;
+    padding: 6px 11px; max-width: 60vw; overflow: hidden;
+    white-space: nowrap; text-overflow: ellipsis;
+  }
+  button {
+    font: inherit; color: var(--text); background: var(--key);
+    border: 1px solid var(--key-edge); border-radius: 12px;
+    min-height: 55px; padding: 10px 8px; cursor: pointer;
+    user-select: none; touch-action: manipulation;
+    transition: background .12s, transform .06s, border-color .12s;
+  }
+  button:hover { background: var(--key-hi); }
+  button:active, button.hit { transform: scale(.97); border-color: var(--accent); }
+  button:disabled { opacity: .45; cursor: default; }
+  .small { min-height: 38px; font-size: 13px; padding: 6px 12px; }
+  .grid {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(310px, 1fr));
+    gap: 14px; align-items: start;
+  }
+  .panel {
+    background: var(--panel); border: 1px solid var(--panel-edge);
+    border-radius: 16px; padding: 12px;
+  }
+  .panel h2 {
+    font-size: 12px; text-transform: uppercase; letter-spacing: .12em;
+    color: var(--muted); margin: 0 0 10px; font-weight: 600;
+  }
+  .row { display: grid; gap: 8px; }
+  .cols-2 { grid-template-columns: repeat(2, 1fr); }
+  .cols-3 { grid-template-columns: repeat(3, 1fr); }
+  .cols-4 { grid-template-columns: repeat(4, 1fr); }
+  .power-red {
+    background: linear-gradient(180deg, #c0392b, #8d2116);
+    border-color: #e05545; font-weight: 700; font-size: 17px;
+  }
+  .power-red:hover { background: linear-gradient(180deg, #d04534, #9c2a1d); }
+  .accent { background: linear-gradient(180deg, #3d6cff, #2a4fd0); border-color: #6d91ff; font-weight: 600; }
+  .accent:hover { background: linear-gradient(180deg, #4d7bff, #3159e0); }
+  .muted-key { color: var(--muted); }
+  .dpad {
+    display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px;
+    grid-template-areas: ". up ." "left enter right" ". down .";
+  }
+  .dpad button { aspect-ratio: 1 / 1; font-size: 21px; }
+  .dpad .up { grid-area: up; } .dpad .down { grid-area: down; }
+  .dpad .left { grid-area: left; } .dpad .right { grid-area: right; }
+  .dpad .enter { grid-area: enter; font-size: 15px; font-weight: 700; }
+  .numpad { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+  .numpad button { font-size: 19px; min-height: 62px; }
+  .numpad .zero { grid-column: span 2; }
+  .color-key { min-height: 44px; font-weight: 700; font-size: 13px; color: #07101a; }
+  .ck-blue { background: #3f87ff; border-color: #74a8ff; }
+  .ck-green { background: #34c471; border-color: #6adfa0; }
+  .ck-red { background: #f25050; border-color: #ff8b8b; }
+  .ck-yellow { background: #e9c23a; border-color: #ffe27a; }
+  .log-panel { display: flex; flex-direction: column; gap: 8px; }
+  .log-head { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+  .log-head h2 { margin: 0; }
+  #statusline {
+    font-size: 12px; color: var(--muted); background: #101720;
+    border: 1px solid var(--panel-edge); border-radius: 10px;
+    padding: 7px 10px; min-height: 32px; word-break: break-all;
+  }
+  #log {
+    margin: 0; padding: 0; list-style: none; font-size: 12px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    max-height: 46vh; overflow: auto; background: #0d131a;
+    border: 1px solid var(--panel-edge); border-radius: 10px;
+  }
+  #log li { padding: 5px 9px; border-bottom: 1px solid #161f29; white-space: pre-wrap; word-break: break-all; }
+  #log li:last-child { border-bottom: 0; }
+  #log li.ok { color: var(--ok); }
+  #log li.err { color: var(--err); }
+  #log li.info { color: var(--muted); }
+  footer { margin-top: 16px; font-size: 12px; color: var(--muted); line-height: 1.7; }
+  footer strong { color: #ffb56b; }
+  @media (max-width: 640px) {
+    body { padding: 10px 10px 32px; }
+    .pill { max-width: 100%; }
+    button { min-height: 58px; }
+    #log { max-height: 34vh; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>4S-C00AS1 <span>Remote</span></h1>
+  <div class="head-tools">
+    <span id="pill" class="pill">未確認</span>
+    <button id="status-btn" class="small">status</button>
+  </div>
+</header>
+
+<main class="grid">
+  <section class="panel">
+    <h2>電源・メニュー</h2>
+    <div class="row cols-2">
+      <button class="power-red" data-code="0" data-name="RC_POWER">電源</button>
+      <button class="accent" data-code="315" data-name="RC_4K">4K</button>
+      <button data-code="16" data-name="RC_MENU">MENU</button>
+      <button data-code="287" data-name="RC_SETUP_MENU">設定</button>
+      <button data-code="97" data-name="RC_EPG">EPG</button>
+      <button data-code="19" data-name="RC_INFO">情報</button>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2>十字・決定</h2>
+    <div class="dpad">
+      <button class="up" data-code="22" data-name="RC_UP">↑</button>
+      <button class="left" data-code="24" data-name="RC_LEFT">←</button>
+      <button class="enter" data-code="21" data-name="RC_ENTER">決定</button>
+      <button class="right" data-code="25" data-name="RC_RIGHT">→</button>
+      <button class="down" data-code="23" data-name="RC_DOWN">↓</button>
+    </div>
+    <div class="row cols-2" style="margin-top:8px">
+      <button data-code="37" data-name="RC_BACK">戻る</button>
+      <button data-code="20" data-name="RC_SELECT">選局</button>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2>チャンネル・音量</h2>
+    <div class="row cols-2">
+      <button data-code="12" data-name="RC_CH_UP">CH ↑</button>
+      <button data-code="13" data-name="RC_CH_DOWN">CH ↓</button>
+      <button data-code="297" data-name="RC_VOLUME_UP">音量 ↑</button>
+      <button data-code="298" data-name="RC_VOLUME_DOWN">音量 ↓</button>
+    </div>
+    <div class="row cols-4" style="margin-top:8px">
+      <button data-code="141" data-name="RC_BSD">BS</button>
+      <button data-code="182" data-name="RC_CS">CS</button>
+      <button data-code="142" data-name="RC_CS1">CS1</button>
+      <button data-code="143" data-name="RC_CS2">CS2</button>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2>数字</h2>
+    <div class="numpad">
+      <button data-code="7" data-name="RC_No7">7</button>
+      <button data-code="8" data-name="RC_No8">8</button>
+      <button data-code="9" data-name="RC_No9">9</button>
+      <button data-code="4" data-name="RC_No4">4</button>
+      <button data-code="5" data-name="RC_No5">5</button>
+      <button data-code="6" data-name="RC_No6">6</button>
+      <button data-code="1" data-name="RC_No1">1</button>
+      <button data-code="2" data-name="RC_No2">2</button>
+      <button data-code="3" data-name="RC_No3">3</button>
+      <button class="zero" data-code="10" data-name="RC_No0">0</button>
+      <button data-code="297" data-name="RC_VOLUME_UP" class="muted-key">音量↑</button>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2>色キー・その他</h2>
+    <div class="row cols-4">
+      <button class="color-key ck-blue" data-code="40" data-name="RC_COLOR_BUTTON1">青</button>
+      <button class="color-key ck-green" data-code="41" data-name="RC_COLOR_BUTTON2">緑</button>
+      <button class="color-key ck-red" data-code="42" data-name="RC_COLOR_BUTTON3">赤</button>
+      <button class="color-key ck-yellow" data-code="43" data-name="RC_COLOR_BUTTON4">黄</button>
+    </div>
+    <div class="row cols-3" style="margin-top:8px">
+      <button data-code="17" data-name="RC_OSD_OFF">OSD OFF</button>
+      <button data-code="18" data-name="RC_FLASHBACK">前の番組</button>
+      <button data-code="45" data-name="RC_WIDE">ワイド</button>
+      <button data-code="26" data-name="RC_PAGE_UP">ページ↑</button>
+      <button data-code="27" data-name="RC_PAGE_DOWN">ページ↓</button>
+      <button data-code="19" data-name="RC_INFO">情報</button>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2>マクロ</h2>
+    <div class="row cols-2">
+      <button class="accent" data-macro="primer">primer</button>
+      <button data-macro="setup">初期設定を抜ける</button>
+      <button data-macro="4k101">4K 101</button>
+      <button data-macro="chup10">CH UP ×10</button>
+    </div>
+    <p style="font-size:12px;color:var(--muted);margin:10px 0 0">
+      primer = <code>{0x000, type 2}</code> を 1 回。同じキーを続けて押すと UIM の
+      リピート判定で捨てられるため、サーバが自動で間に入れます。
+    </p>
+  </section>
+
+  <section class="panel log-panel">
+    <div class="log-head">
+      <h2>ログ</h2>
+      <button id="clear-btn" class="small">消去</button>
+    </div>
+    <div id="statusline">最終キー: —</div>
+    <ol id="log"></ol>
+  </section>
+</main>
+
+<footer>
+  <strong>認証なし・LAN 専用。</strong>
+  <code>0.0.0.0:8484</code> を信頼できるネットワーク内でのみ公開してください。
+  リモコン受光部が壊れているため、この UI は Q_UIM (qid 0x7F, msg 0x2044) に
+  キーイベントを直接送ります。POW_OFF (0x021) は送りません。<br>
+  キーボード: 矢印 / Enter / Backspace / 数字 / <code>c</code> CH↑ /
+  <code>n</code> CH↓ / <code>+</code> − 音量 / <code>m</code> MENU / <code>b</code> 戻る。
+</footer>
+
+<script>
+(() => {
+  const logEl = document.getElementById('log');
+  const pill = document.getElementById('pill');
+  const statusline = document.getElementById('statusline');
+  const MAX_LOG = 80;
+
+  const hex = (code) => '0x' + Number(code).toString(16).padStart(3, '0').toUpperCase();
+  const clock = () => new Date().toTimeString().slice(0, 8);
+  const nm = (code) => {
+    const b = document.querySelector(`button[data-code="${code}"]`);
+    return b ? (b.dataset.name || b.textContent.trim()) : hex(code);
+  };
+
+  function logLine(kind, text) {
+    const li = document.createElement('li');
+    li.className = kind;
+    li.textContent = text;
+    logEl.prepend(li);
+    while (logEl.children.length > MAX_LOG) logEl.lastElementChild.remove();
+  }
+
+  function flash(button) {
+    button.classList.add('hit');
+    setTimeout(() => button.classList.remove('hit'), 140);
+  }
+
+  async function post(path, payload) {
+    const res = await fetch(path, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    let data = {};
+    try { data = await res.json(); } catch (_) { data = { ok: false, error: 'non-JSON response' }; }
+    return { res, data };
+  }
+
+  async function sendKey(code, opts = {}) {
+    const label = nm(code);
+    const t0 = performance.now();
+    try {
+      const { res, data } = await post('/api/key', { code, ...opts });
+      const ms = Math.round(performance.now() - t0);
+      const extra = data.primer != null ? ` · primer ${hex(data.primer)}` : '';
+      logLine(res.ok && data.ok ? 'ok' : 'err',
+        `${clock()} ${label} ${hex(code)} → HTTP ${res.status} (${ms}ms)${extra}`);
+      if (data.error) logLine('err', `  ${data.error}`);
+      statusline.textContent = `最終キー: ${label} ${hex(code)} @ ${clock()} · HTTP ${res.status}`;
+    } catch (err) {
+      logLine('err', `${clock()} ${label} ${hex(code)} → 送信失敗: ${err}`);
+    }
+  }
+
+  const MACROS = {
+    primer: { label: 'primer', steps: [{ code: 0, type: 2 }] },
+    setup: {
+      label: '初期設定を抜ける (BACK×3)',
+      steps: [
+        { code: 0x25, delay_ms: 600 },
+        { code: 0x25, delay_ms: 600 },
+        { code: 0x25 },
+      ],
+    },
+    '4k101': {
+      label: '4K 101',
+      steps: [
+        { code: 0x13b, delay_ms: 500 },
+        { code: 0x01, delay_ms: 350 },
+        { code: 0x0a, delay_ms: 350 },
+        { code: 0x01, delay_ms: 500 },
+        { code: 0x15 },
+      ],
+    },
+    chup10: {
+      label: 'CH UP ×10',
+      steps: Array.from({ length: 10 }, (_, i) => ({
+        code: 0x0c,
+        delay_ms: i === 9 ? 0 : 350,
+      })),
+    },
+  };
+
+  async function runMacro(name) {
+    const macro = MACROS[name];
+    if (!macro) return;
+    const buttons = [...document.querySelectorAll('[data-macro]')];
+    buttons.forEach((b) => (b.disabled = true));
+    const t0 = performance.now();
+    logLine('info', `${clock()} macro ${macro.label} → 送信開始`);
+    try {
+      const { res, data } = await post('/api/macro', { steps: macro.steps });
+      const ms = Math.round(performance.now() - t0);
+      logLine(res.ok && data.ok ? 'ok' : 'err',
+        `${clock()} macro ${macro.label} → HTTP ${res.status} (${ms}ms, ${macro.steps.length} steps)`);
+      if (data.error) logLine('err', `  ${data.error}`);
+      statusline.textContent = `マクロ: ${macro.label} · HTTP ${res.status}`;
+    } catch (err) {
+      logLine('err', `${clock()} macro ${macro.label} → 送信失敗: ${err}`);
+    } finally {
+      buttons.forEach((b) => (b.disabled = false));
+    }
+  }
+
+  document.querySelectorAll('button[data-code]').forEach((button) => {
+    button.addEventListener('click', () => {
+      flash(button);
+      const code = Number(button.dataset.code);
+      const opts = button.dataset.type ? { type: Number(button.dataset.type) } : {};
+      sendKey(code, opts);
+    });
+  });
+
+  document.querySelectorAll('button[data-macro]').forEach((button) => {
+    button.addEventListener('click', () => {
+      flash(button);
+      runMacro(button.dataset.macro);
+    });
+  });
+
+  document.getElementById('clear-btn').addEventListener('click', () => {
+    logEl.innerHTML = '';
+    logLine('info', `${clock()} ログを消去しました`);
+  });
+
+  async function refreshStatus() {
+    try {
+      const res = await fetch('/api/status');
+      const s = await res.json();
+      const threads = Object.entries(s.threads || {})
+        .filter(([, on]) => on).map(([k]) => k).join('/') || 'なし';
+      const si = s.si && s.si.ok
+        ? `SI TS${s.si.tlv_stream_id}/ON${s.si.original_network_id}/SID${s.si.service_id}`
+        : 'SI なし';
+      const q = s.q_uim && s.q_uim.ok
+        ? `UIM msqid=${s.q_uim.msqid} qnum=${s.q_uim.qnum}`
+        : 'UIM 不明';
+      const regs = s.regs && s.regs.ok
+        ? `lock=${s.regs.lock} b2=${(s.regs.bank2_selection || []).map(hex).join(',')}`
+        : 'regs 読取不可';
+      const last = s.last_key
+        ? `${s.last_key.name}(${hex(s.last_key.code)}) ${s.last_key.age_s}s 前`
+        : 'なし';
+      pill.textContent = `up ${s.uptime_s}s · ${q}`;
+      statusline.textContent = `uptime ${s.uptime_s}s · ${q} · ${si} · ${regs} · threads ${threads} · 最終キー ${last}`;
+      logLine('info', `${clock()} status: ${statusline.textContent}`);
+    } catch (err) {
+      pill.textContent = 'status 取得失敗';
+      logLine('err', `${clock()} status → ${err}`);
+    }
+  }
+
+  document.getElementById('status-btn').addEventListener('click', refreshStatus);
+
+  document.addEventListener('keydown', (event) => {
+    if (event.ctrlKey || event.metaKey || event.altKey) return;
+    if (event.target && /input|textarea|select/i.test(event.target.tagName)) return;
+
+    const fixed = {
+      ArrowUp: 0x16, ArrowDown: 0x17, ArrowLeft: 0x18, ArrowRight: 0x19,
+      Enter: 0x15, Backspace: 0x25, Escape: 0x25,
+      ' ': 0x13b, m: 0x10, b: 0x25, i: 0x13,
+      '+': 0x129, '=': 0x129, '-': 0x12a, c: 0x0c, n: 0x0d,
+    };
+    let code = null;
+    if (event.key >= '0' && event.key <= '9') {
+      code = event.key === '0' ? 0x0a : Number(event.key);
+    } else if (Object.prototype.hasOwnProperty.call(fixed, event.key)) {
+      code = fixed[event.key];
+    }
+    if (code === null) return;
+    event.preventDefault();
+    sendKey(code, {});
+  });
+
+  logLine('info', `${clock()} UI ready · 認証なし・LAN 専用`);
+})();
+</script>
+</body>
+</html>

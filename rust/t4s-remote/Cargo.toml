@@ -1,0 +1,28 @@
+[package]
+name = "t4s-remote"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT"
+description = "LAN remote-control web UI for the SHARP 4S-C00AS1 (Q_UIM key injection)"
+
+# Stand-alone workspace: this crate is built with
+#   cargo build --release --target armv7-unknown-linux-musleabihf \
+#         --manifest-path rust/t4s-remote/Cargo.toml
+# so it does not need to be listed in rust/Cargo.toml (which other work is
+# editing).  `t4s-core` still resolves through its own workspace manifest.
+[workspace]
+
+[dependencies]
+t4s-core = { path = "../t4s-core" }
+
+[[bin]]
+name = "t4s-remote"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
