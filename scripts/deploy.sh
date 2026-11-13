@@ -27,11 +27,21 @@ echo "[*] Transferring to $HOST ..."
 sh "$ROOT/scripts/telnet-run.sh" "$HOST" "
 set -e
 mkdir -p /media/usb
-grep -q ' /media/usb vfat ' /proc/mounts || mount -t vfat /dev/sda1 /media/usb
-if ! grep -q ' /mnt/t4s ext4 ' /proc/mounts; then
-  losetup /dev/loop0 /media/usb/t4s.img 2>/dev/null || true
+# The USB vfat is often auto-mounted read-only (dm-verity / fsck state /
+# a usb-storage quirk).  A loop device backed by a file on a read-only
+# filesystem is read-only too, which silently forces the ext4 image to mount
+# ro and makes the drop below fail.  Mount it, then retry rw if needed.
+if ! grep -q ' /media/usb vfat ' /proc/mounts; then
+  mount -t vfat /dev/sda1 /media/usb || mount -o remount,rw /media/usb
+fi
+grep -q ' /media/usb vfat rw,' /proc/mounts || mount -o remount,rw /media/usb
+if ! grep -q ' /mnt/t4s ext4 rw,' /proc/mounts; then
+  umount /mnt/t4s 2>/dev/null || true
+  losetup -d /dev/loop0 2>/dev/null || true
+  losetup /dev/loop0 /media/usb/t4s.img
   mount -t ext4 /dev/loop0 /mnt/t4s
 fi
+grep -q ' /mnt/t4s ext4 rw,' /proc/mounts || { echo 'deploy: /mnt/t4s is not writable' >&2; exit 1; }
 mkdir -p /mnt/t4s/opt/t4s/bin /mnt/t4s/opt/t4s/epg /mnt/t4s/run /mnt/t4s/var/log
 cd /mnt/t4s/opt/t4s/bin
 for f in mirakc t4s-tuner t4s-cas t4s-remote; do

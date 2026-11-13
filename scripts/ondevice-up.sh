@@ -21,12 +21,27 @@ REMOTE_LOG=/tmp/t4s-remote.log
 REMOTE_PORT=${REMOTE_PORT:-8484}
 
 mkdir -p "$USB" "$DATA"
+# The USB vfat is frequently auto-mounted read-only, and sometimes at an
+# auto-chosen path (e.g. /media/sda1) rather than $USB.  A loop device backed
+# by a file on a read-only filesystem is read-only too, which silently forces
+# the ext4 image to mount ro and breaks writes.  Make a rw vfat visible at
+# $USB, bind-mounting the existing mount if the device is already taken.
 if ! grep -q " $USB vfat " /proc/mounts; then
-    mount -t vfat /dev/sda1 "$USB"
+    if mount -t vfat /dev/sda1 "$USB" 2>/dev/null; then
+        :
+    else
+        existing=$(awk '$1=="/dev/sda1"{print $2; exit}' /proc/mounts)
+        [ -n "$existing" ] && mount -o remount,rw "$existing" && mount --bind "$existing" "$USB"
+    fi
+fi
+if grep -q " $USB vfat " /proc/mounts; then
+    grep -q " $USB vfat rw," /proc/mounts || mount -o remount,rw "$USB"
 fi
 
-if ! grep -q " $DATA ext4 " /proc/mounts; then
-    losetup /dev/loop0 "$IMG" 2>/dev/null || true
+if ! grep -q " $DATA ext4 rw," /proc/mounts; then
+    umount "$DATA" 2>/dev/null || true
+    losetup -d /dev/loop0 2>/dev/null || true
+    losetup /dev/loop0 "$IMG"
     mount -t ext4 /dev/loop0 "$DATA"
 fi
 

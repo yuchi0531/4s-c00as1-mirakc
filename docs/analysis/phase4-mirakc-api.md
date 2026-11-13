@@ -470,3 +470,107 @@ send 141 0 0 もせず、直ちに中止」に従い、追加のキー送信・C
 
 **要・電源再投入**。mirakc は停止状態を維持している。
 
+
+---
+
+## 12. DEMUX ring 拡張後の恒久配置と mirakc 連続取得（2026-11-14 04:5x JST）
+
+`commit a3ea1c5`（DEMUX 出力 ring を 0x6000→0x18000 units）を実機へ恒久配置し、
+mirakc 経由で連続取得を確認した。
+
+### 12.1 ext4 read-only の原因
+
+fresh boot 直後の USB vfat は **`/media/sda1` に read-only で自動マウント**される:
+
+```text
+/dev/sda1 /media/sda1 vfat ro,... 0 0
+```
+
+`/media/usb` が未マウントのため `ondevice-up.sh` の `mount -t vfat /dev/sda1
+/media/usb` は `Device or resource busy` で失敗し、その後 `losetup /dev/loop0
+/media/usb/t4s.img` が「ファイルが無い」で失敗、ext4 は ro のまま残っていた。
+dmesg に ext4/vfat の **I/O error や強制 remount は無い**（fs 破損ではない）。
+
+修正: `scripts/ondevice-up.sh` と `scripts/deploy.sh` を
+「既存の vfat マウントを rw に remount し、`$USB` へ bind mount してから
+losetup / ext4 を rw でマウント」に変更。
+
+### 12.2 恒久配置
+
+```text
+/mnt/t4s/opt/t4s/bin/t4s-tuner
+  md5 43c416c53b99fa9d54a8e47018691b6e
+  size 552884, mode 755, owner root
+```
+
+電源再投入 → `sh /media/usb/ondevice-up.sh` 後も同一 md5 が残ることを確認
+（配置は永続）。mirakc はこのバイナリを spawn する。
+
+### 12.3 mirakc 経由の連続取得（10 秒間隔）
+
+`/api/channels/{type}/{channel}/stream?decode=0` を `--max-time` で打ち切る。
+ストリームは自然終了しないため curl は rc=28（timeout）になるが、
+HTTP は 200 が返り bytes>0 が取得できれば成功。
+
+fresh boot 後、mirakc pid 884 / version 4.0.0-dev.0 の状態で:
+
+| 順 | channel | decode | HTTP | bytes | 先頭 | 備考 |
+|---:|---|---|---:|---:|---|---|
+| 1 | CS8 | 0 | 200 | 21,757,952 | `47 10 0f 1b` | |
+| 2 | CS8 | 0 | 200 | 23,461,888 | `47 10 0e da` | **2 回目も成功** |
+| 3 | BS13_0 | 0 | 200 | 10,747,904 | `47 1f ff 10` | |
+| 4 | BS13_0 | 0 | 200 | 9,437,184 | `47 01 40 dc`（別 run） | **2 回目も成功** |
+| 5 | BS13_0 | 1 | 404 | 38 | `{"code":404...}` | 後述の CAS startup gate |
+
+CS8 は追加試行で **5/5 連続成功**、BS13_0 は **4/4 連続成功**（いずれも 6 秒、12 秒間隔）。
+
+```text
+cs8_1..5: http=200 bytes≈22MB first=47...
+bs_1..4 : http=200 bytes=9.4-11.2MB first=47...
+```
+
+取得 TS は 188B sync ratio **1.0000**。ffprobe:
+
+- CS8 program 55: **mpeg2video 1440x1080 + aac LC 48000Hz 2ch**（クリア）
+- BS13_0: mpeg2video + aac + arib_caption（`decode=0` のため映像は scrambled）
+
+各取得後、実機 graph は **devices count=11 / mmr61f0=0x10** に戻り、残骸なし。
+
+### 12.4 decode=1 の 404 は CAS startup gate（既存）
+
+BS/BS13_0 `decode=1` は **HTTP 404** を返す（`{"code":404,"reason":null,"errors":[]}`）。
+mirakc ログでは tuner と `t4s-cas` が起動し、約 2.5 秒で 404 → `StopStreaming`。
+`t4s-cas` を直接実行すると:
+
+```text
+t4s-cas: decode: BS2K startup exceeded 4 MiB:
+  PMTs={257, 513, 515, 1025, 1026, 1027} seen={257, 513, 515} ECMs={289}
+  accepted=[289] scrambled_PIDs={320, 321, 328, 329, 330, 584}
+```
+
+BS13_0 の PAT は program 141/142/143（PMT 257/513/515）に加えて **744/745
+（PMT 1025/1026）** を持つが、後者の PMT はこの TS に現れない。`t4s-cas` は
+`all_services` でも `pmts == seen_pmts` を要求するため、4 MiB 待って abort する。
+
+- この挙動は `rust/t4s-core/src/descramble.rs` の startup gate に由来し、
+  **commit a3ea1c5 は descramble.rs / t4s-cas を触っていない**（git で確認）。
+  すなわち ring 拡張とは無関係の**既存**の問題。
+- CS8 `decode=1` も 404（CAS entitlement 無し、既知）。
+- §9.2 でも BS13_0 decode=1 は 404 で、当時は「3 秒以内に TS が来ない」と
+  記録していたが、実際は CAS が毎回 abort していた（mirakc の
+  `stream-time-limit` 約 3 秒はこの abort とほぼ同時）。
+
+### 12.5 4K
+
+製品は **MIXER/Sink/buf_buf=false、`si=None`**（4K 視聴状態ではない）。
+指示どおり 4K 選局・切替は行わず、**記録のみ**。BS4K/45170 の取得は製品が
+緑（視聴）状態のときに限られる（§9.1 の実績）。
+
+### 12.6 結論
+
+- 新 `t4s-tuner`（md5 43c416c5...）を **恒久配置**し、再起動をまたいで保持。
+- mirakc 経由で **CS8 decode=0 を 5/5、BS13_0 decode=0 を 4/4 連続取得**。
+  ring 拡張の効果は API 経路でも確認できる。
+- 各取得後に graph 残骸なし（devices 11 / mmr61f0=0x10）。
+- `decode=1` の 404 は `t4s-cas` の startup gate（PAT 未達 PMT）で、ring とは
+  別の既存課題。CS の decode=1 は CAS entitlement 無しで 404。
