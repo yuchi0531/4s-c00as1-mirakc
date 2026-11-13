@@ -635,7 +635,13 @@ static REGS: Mutex<RegsCache> = Mutex::new(RegsCache {
 });
 
 const REGS_CACHE_SECS: u64 = 30;
-const REGS_WAIT: Duration = Duration::from_secs(2);
+/// Never let an I2C0 semaphore wait stall a status request.  The read runs
+/// on a worker thread; after 200 ms we answer with the cached value (or
+/// `in progress`) and let the worker fill the cache for the next poll.
+const REGS_WAIT: Duration = Duration::from_millis(200);
+/// A browser may open a connection without sending a request (preconnect,
+/// cancelled navigation).  Do not keep such a handler thread for 30 s.
+const CONN_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn regs_json() -> String {
     let (tx, rx) = std::sync::mpsc::channel();
@@ -655,7 +661,7 @@ fn regs_json() -> String {
         cache.in_flight = true;
     }
 
-    std::thread::spawn(move || {
+    let spawned = std::thread::Builder::new().spawn(move || {
         let text = read_regs();
         let ok = text.contains("\"ok\":true");
         let mut cache = REGS.lock().unwrap_or_else(|e| e.into_inner());
@@ -666,6 +672,14 @@ fn regs_json() -> String {
         }
         let _ = tx.send(text);
     });
+    if let Err(e) = spawned {
+        let mut cache = REGS.lock().unwrap_or_else(|e| e.into_inner());
+        cache.in_flight = false;
+        return format!(
+            "{{\"ok\":false,\"reason\":\"{}\"}}",
+            json_escape(&format!("cannot start I2C reader: {e}"))
+        );
+    }
 
     match rx.recv_timeout(REGS_WAIT) {
         Ok(text) => text,
@@ -757,8 +771,9 @@ fn status_json(state: &State) -> String {
 }
 
 fn handle_conn(mut stream: TcpStream, state: Arc<State>) {
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
-    let _ = stream.set_write_timeout(Some(Duration::from_secs(30)));
+    let _ = stream.set_nodelay(true);
+    let _ = stream.set_read_timeout(Some(CONN_TIMEOUT));
+    let _ = stream.set_write_timeout(Some(CONN_TIMEOUT));
     let started = Instant::now();
     match read_request(&mut stream) {
         Ok(request) => {
@@ -850,7 +865,16 @@ fn main() {
         match stream {
             Ok(stream) => {
                 let state = Arc::clone(&state);
-                std::thread::spawn(move || handle_conn(stream, state));
+                // One thread per connection, so a slow /api/status (I2C
+                // semaphore) or a key/macro sleep never blocks another
+                // request.  `thread::spawn` panics when the thread cannot be
+                // created; use the Builder so exhaustion only drops one
+                // connection instead of aborting the whole server.
+                if let Err(e) =
+                    std::thread::Builder::new().spawn(move || handle_conn(stream, state))
+                {
+                    log(&format!("cannot spawn connection handler: {e}"));
+                }
             }
             Err(e) => log(&format!("accept error: {e}")),
         }

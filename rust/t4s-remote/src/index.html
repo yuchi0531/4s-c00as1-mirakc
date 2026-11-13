@@ -268,8 +268,21 @@
     setTimeout(() => button.classList.remove('hit'), 140);
   }
 
+  // A dropped SYN or a busy product can hold a request open for tens of
+  // seconds.  Abort so a button press reports a failure instead of appearing
+  // to do nothing forever.
+  async function fetchWithTimeout(path, opts = {}, timeoutMs = 8000) {
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), timeoutMs);
+    try {
+      return await fetch(path, { ...opts, signal: ctl.signal });
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
   async function post(path, payload) {
-    const res = await fetch(path, {
+    const res = await fetchWithTimeout(path, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
@@ -368,7 +381,7 @@
 
   async function refreshStatus() {
     try {
-      const res = await fetch('/api/status');
+      const res = await fetchWithTimeout('/api/status', {}, 10000);
       const s = await res.json();
       const threads = Object.entries(s.threads || {})
         .filter(([, on]) => on).map(([k]) => k).join('/') || 'なし';

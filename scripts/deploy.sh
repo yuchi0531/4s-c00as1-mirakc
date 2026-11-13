@@ -9,6 +9,12 @@ PORT=${HTTP_PORT:-8080}
 
 cp "$ROOT/config/config.yml" "$ROOT/config/strings.yml" "$HTTP/"
 cp "$ROOT/scripts/ondevice-up.sh" "$ROOT/scripts/ondevice-down.sh" "$HTTP/"
+# Use the freshly built standalone crate binary when it exists; otherwise the
+# copy already in .tmp/http is transferred.
+REMOTE_BIN="$ROOT/rust/target/remote/armv7-unknown-linux-musleabihf/release/t4s-remote"
+if [ -f "$REMOTE_BIN" ]; then
+    cp "$REMOTE_BIN" "$HTTP/t4s-remote"
+fi
 
 echo "[*] Start the HTTP server in another terminal: make serve"
 echo "[*] Transferring to $HOST ..."
@@ -23,7 +29,7 @@ if ! grep -q ' /mnt/t4s ext4 ' /proc/mounts; then
 fi
 mkdir -p /mnt/t4s/opt/t4s/bin /mnt/t4s/opt/t4s/epg /mnt/t4s/run /mnt/t4s/var/log
 cd /mnt/t4s/opt/t4s/bin
-for f in mirakc t4s-tuner t4s-cas; do
+for f in mirakc t4s-tuner t4s-cas t4s-remote; do
   wget -q http://192.168.100.100:$PORT/\$f -O \$f
   chmod 755 \$f
 done

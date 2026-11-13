@@ -8,6 +8,7 @@
 # /mnt/t4s/opt/t4s/bin/t4s-remote (see docs/REMOTE-UI.md for the build and
 # deploy steps) and manages /tmp/t4s-remote.log and /tmp/t4s-remote.pid.
 #
+# `start` is idempotent: a live pid is left alone, a stale pid file is removed.
 # The UI itself is unauthenticated.  Keep it on a trusted LAN.
 set -eu
 
@@ -38,12 +39,43 @@ run() {
 
 case "$ACTION" in
     start)
-        run "$BIN --daemon --port $PORT"
-        sleep 1
-        echo "started: http://$HOST:$PORT/"
+        # Runs on the device.  Every branch prints something, so run() does not
+        # treat a successful no-op as a lost session and start it a second time.
+        run "
+P=\$(cat $PIDFILE 2>/dev/null)
+if [ -n \"\$P\" ] && kill -0 \"\$P\" 2>/dev/null; then
+    echo \"already running: pid \$P, http://$HOST:$PORT/\"
+else
+    rm -f $PIDFILE
+    if [ ! -x $BIN ]; then
+        echo \"t4s-remote missing: $BIN\"
+        exit 1
+    fi
+    $BIN --daemon --port $PORT
+    sleep 1
+    P=\$(cat $PIDFILE 2>/dev/null)
+    if [ -n \"\$P\" ] && kill -0 \"\$P\" 2>/dev/null; then
+        echo \"started: pid \$P, http://$HOST:$PORT/\"
+        tail -2 $LOGFILE 2>/dev/null
+    else
+        echo \"start failed; $LOGFILE:\"
+        tail -5 $LOGFILE 2>/dev/null
+        exit 1
+    fi
+fi
+"
         ;;
     stop)
-        run "P=\$(cat $PIDFILE 2>/dev/null); [ -n \"\$P\" ] && kill \$P; rm -f $PIDFILE; echo stopped"
+        run "
+P=\$(cat $PIDFILE 2>/dev/null)
+if [ -n \"\$P\" ] && kill -0 \"\$P\" 2>/dev/null; then
+    kill \$P
+    echo \"stopped: pid \$P\"
+else
+    echo \"not running (stale pid '\$P')\"
+fi
+rm -f $PIDFILE
+"
         ;;
     restart)
         "$0" stop "$HOST"
@@ -51,7 +83,7 @@ case "$ACTION" in
         "$0" start "$HOST"
         ;;
     status)
-        run "P=\$(cat $PIDFILE 2>/dev/null); echo pid=\$P; ps -A | grep t4s-remote; tail -3 $LOGFILE"
+        run "P=\$(cat $PIDFILE 2>/dev/null); echo pid=\$P; ps -A | grep t4s-remote; netstat -ltn 2>/dev/null | grep :$PORT; tail -3 $LOGFILE 2>/dev/null"
         ;;
     *)
         echo "usage: sh scripts/ondevice-remote.sh {start|stop|restart|status} [host]" >&2

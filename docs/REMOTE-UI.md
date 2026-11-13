@@ -27,6 +27,10 @@ cp rust/target/remote/armv7-unknown-linux-musleabihf/release/t4s-remote .tmp/htt
 `t4s-remote` は独自の `[workspace]` を持つので、`rust/Cargo.toml` の `members`
 には追加していません（他作業と衝突しないため）。`t4s-core` へは path 依存です。
 
+`scripts/deploy.sh` は `mirakc` / `t4s-tuner` / `t4s-cas` と一緒に
+`t4s-remote` も `.tmp/http` から実機 `/mnt/t4s/opt/t4s/bin/` へ転送します
+（ビルド済みの `rust/target/remote/.../t4s-remote` があればそれを優先）。
+
 `.tmp/http` は `make serve`（`python3 -m http.server 8080`）で配信されています。
 実機への配置は telnet 越しに wget します（`.tmp/dev.sh` は 1 コマンド実行用）:
 
@@ -44,14 +48,19 @@ sh .tmp/dev.sh 'wget -q http://192.168.100.100:8080/t4s-remote \
 
 ```sh
 # 起動（推奨: 自分で daemon 化し、PID を /tmp/t4s-remote.pid に書く）
+# 冪等: pid が生存していれば "already running" で何もしない。
+# stale PID ファイルは削除して起動し直す。
 sh scripts/ondevice-remote.sh start
 
-# 状態
+# 状態（pid / ps / LISTEN / ログ末尾）
 sh scripts/ondevice-remote.sh status
 
 # 停止
 sh scripts/ondevice-remote.sh stop
 ```
+
+電源再投入後は `scripts/ondevice-up.sh` が mirakc と一緒に自動起動します
+（§10）。`ondevice-remote.sh start` も同じ冪等チェックを持ちます。
 
 実機上で直接:
 
@@ -138,8 +147,10 @@ kill $(cat /tmp/t4s-remote.pid)
 - `si`: `t4s_core::si::live_service("/tmp/adsb")`。MH-SDT と MPT が食い違う遷移中は `ok:false`。
 - `regs`: `t4s_core::gr_i2c::read_output_regs()` の `lock` と `bank2_selection`。
   I2C0 セマフォは製品チューナや他の診断が数秒保持することがあるため、
-  **ワーカースレッドで読み、2 秒待っても終わらなければ `ok:false` を返します**。
-  成功値は 30 秒キャッシュし、その間は再読込しません。
+  **ワーカースレッドで非同期に読み、200 ms 待っても終わらなければ
+  `ok:false`（または直近のキャッシュ）を返します**。成功値は 30 秒キャッシュし、
+  その間は再読込しません。HTTP 処理は接続ごとのスレッドなので、
+  status の I2C 待ちがキー POST をブロックすることはありません。
 - `q_uim`: `/tmp/bdh_out_msgh.lst` の `127-<msqid>` と `/proc/sysvipc/msg` の
   `qnum` / `lspid` / `lrpid`。`qnum=0` は UIM が消費済み。
 - `last_key`: このサーバプロセスが最後に送ったキー。
@@ -285,16 +296,57 @@ POST /api/key {"code":21}                  -> 200 {"ok":true,"code":21,...,"prim
 `qnum=0`, `lspid=279 (abs)`, `lrpid=476 (abs.T_UIM)` → 3 通とも UIM が受信・消費済み。
 `/api/status` の `last_key` も `RC_ENTER 21:10:53` を示しています。
 
+### 8.1 電源再投入後の復旧試験（2026-11-13 21:52–21:57 JST）
+
+電源再投入後、8484 は LISTEN していませんでした（`/tmp/t4s-remote.pid` 無し、
+`ps -A` に `t4s-remote` 無し）。`ondevice-remote.sh restart` で
+`/mnt/t4s/opt/t4s/bin/t4s-remote`（md5 `dfb6b967…`）を pid 1333 で起動しました。
+
+```
+$ curl -s -o /dev/null -w '%{http_code} %{time_total}\n' http://192.168.1.154:8484/
+200 0.007
+$ curl -s http://192.168.1.154:8484/api/keys | …  # 318 件
+200 0.004  (0.004s)
+$ curl -s -w ' %{time_total}\n' http://192.168.1.154:8484/api/status
+200 0.091 (2 回目), 0.171 (キャッシュ更新時)
+$ POST /api/key {"name":"RC_BACK"}
+{"ok":true,"code":37,"name":"RC_BACK","type":0,"release":true,"primer":0}
+200 0.096
+```
+
+キュー（`/proc/sysvipc/msg`、直後 → 数秒後）:
+
+```
+0 98307 777 736 8 1333 471 …   # qnum=8, lspid=1333 (t4s-remote が送信)
+0 98307 777   0 0  279 279 …   # 数秒後 qnum=0（UIM が消費）
+```
+
+`lspid=1333` は t4s-remote プロセス自身。`RC_BACK` は primer 0x000（再起動後の
+初回のみ）→ `0x025` press → release の 3 通で、msgsnd は成功しています。
+その直後 qnum が一時的に 8 まで増えたのは UIM が別作業で一時的に止まっていたためで、
+数秒後に 0 へ戻りました（サーバ側の送信失敗ではありません）。
+
+同じ時間帯、ホスト→実機の新規 TCP 接続が 2–3 回に 1 回 SYN タイムアウトしました
+（`curl` の `time_connect=0`、`nc -z 8484` が 2 秒で失敗）。ただし **mirakc 40772 も
+同じ確率で失敗**し、ping と telnet 2323 は通っていました。実機内
+`wget http://127.0.0.1:8484/api/status` は常に成功（84 ms）。したがって 8484 の停止ではなく、
+ホスト `192.168.100.100` → ゲートウェイ `192.168.100.3` → 実機の経路で新規 SYN が
+落ちる負荷/ネットワーク起因です（再試行で 200）。サーバは接続ごとにスレッドを
+立てるため、status が他リクエストをブロックしません。
+
 ---
 
 ## 9. 既知の制約
 
 1. **`regs` は I2C0 セマフォ待ちで `ok:false` になることがある。**
-   実機では他作業の `t4s-probe` が I2C を保持していたため、2 秒で打ち切りました。
-   製品が idle なら `t4s-core` 側の 5 秒待ちで成功します（成功値は 30 秒キャッシュ）。
-2. **製品負荷が高いと HTTP が不安定。** 試験時は load average 32、abs 281 スレッド。
-   同一ホストから mirakc の API も時々タイムアウトしたため、ネットワーク/負荷起因であり
-   サーバ固有の問題ではありません。再試行で 200 が返ります。
+   読み取りはワーカースレッドで行い、**200 ms** で打ち切ってキャッシュまたは
+   `ok:false` を返します。成功値は 30 秒キャッシュ。read は接続スレッドを
+   ブロックしません。製品が idle なら `t4s-core` 側の 5 秒待ちで成功します。
+2. **製品負荷が高いとホスト→実機の新規 TCP 接続が落ちる。** 試験時は load average
+   36–43、abs 500 スレッド。`curl` が `time_connect=0` でタイムアウトする一方、
+   実機内 `127.0.0.1` は常に応答しました。mirakc 40772 も同じ確率で失敗するため、
+   8484 固有ではありません（ホストは既定ゲートウェイ経由）。再試行で 200 が返ります。
+   サーバは接続ごとにスレッドを立て、読み取りは 5 秒で打ち切ります。
 3. **4K 101 マクロは未押下。** 4K 選局の実機検証は他作業の完了後に実施してください。
 4. **色キーの並び（青/緑/赤/黄 ⇔ `0x028–0x02B`）は未確定。** 名前は
    `RC_COLOR_BUTTON1–4` で、UI の色は暫定です。
@@ -303,3 +355,52 @@ POST /api/key {"code":21}                  -> 200 {"ok":true,"code":21,...,"prim
    `ps -A` か `/tmp/t4s-remote.pid` を使ってください。
 7. 認証がないため、`--bind 127.0.0.1` での利用や、リバースプロキシ配下での
    認証付与を検討してください（現状の実装は `--bind` を受け付けます）。
+
+---
+
+## 10. 電源再投入後の自動起動と復旧
+
+`scripts/ondevice-up.sh` は USB マウント → mirakc 起動のあと、
+`/mnt/t4s/opt/t4s/bin/t4s-remote --daemon --port 8484` を実行します。
+
+- **冪等**: `/tmp/t4s-remote.pid` の pid が生存していれば起動せず
+  `t4s-remote already running` を出します。stale pid は削除してから起動。
+- **mirakc を止めない**: バイナリ欠落・8484 bind 失敗など remote の起動失敗は
+  ログに出すだけで、`start_remote` は成功扱いで戻ります。mirakc は稼働継続。
+- mirakc が既に動いていても remote の起動チェックは毎回実行されます
+  （以前の「mirakc 稼働中なら即 exit」は廃止）。
+
+再投入後の復旧手順（ホスト側）:
+
+```sh
+# 1. 状態（pid / ps / LISTEN / ログ末尾）
+sh scripts/ondevice-remote.sh status
+
+# 2. 停止していれば起動（生存中なら "already running" で no-op）
+sh scripts/ondevice-remote.sh start
+
+# 3. LAN 疎通（すべて 200 を確認）
+curl -s -o /dev/null -w '%{http_code}\n' http://192.168.1.154:8484/
+curl -s http://192.168.1.154:8484/api/keys | \
+  python3 -c 'import json,sys; print(len(json.load(sys.stdin)))'   # 318
+curl -s http://192.168.1.154:8484/api/status
+```
+
+実機上で直接確認する場合:
+
+```sh
+ps -A | grep t4s-remote
+netstat -ltn | grep :8484
+tail -5 /tmp/t4s-remote.log
+/mnt/t4s/opt/t4s/bin/t4s-remote --daemon --port 8484   # 未起動なら
+```
+
+8484 が LISTEN なのにホストから接続できないときは、**mirakc 40772 と
+ping / telnet 2323 も同時に確認**してください。実測ではホスト→実機の経路
+（`192.168.100.100` → gateway `192.168.100.3` → `192.168.1.154`）で
+新規 TCP SYN が落ちることがあり、40772 も同じ確率でタイムアウトしました。
+サーバ停止ではありません。数秒おいて再試行してください。
+
+注意: `ondevice-remote.sh start` はデバイス側で pid を確認するため、
+`/mnt/t4s` がアンマウントされている／telnet が落ちている場合は
+先に `ondevice-up.sh`（USB マウントと mirakc 起動）を実行してください。
