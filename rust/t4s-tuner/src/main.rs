@@ -277,11 +277,17 @@ fn run_2k(args: &Args, deadline: Option<Instant>) -> Result<(), String> {
     let (physical_port, logical_port, remap) = if is_cs {
         // Product 2K route: physical TSI1 -> logical TSI0 by default.
         // T4S_CS_TSI_PORT=0 is a diagnostic for the alternate physical port.
+        // T4S_CS_REMAP=1 reuses the BS route: physical TSI -> logical TSI1
+        // with the logical1->physical0 remap.
         let port = std::env::var("T4S_CS_TSI_PORT")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(0);
-        (port, 0, false)
+        if std::env::var("T4S_CS_REMAP").is_ok() {
+            (port, 1, true)
+        } else {
+            (port, 0, false)
+        }
     } else if native_tsi {
         (0, 0, false)
     } else {

@@ -118,3 +118,79 @@ program 218 の video/audio PID を抜き出し、`ffmpeg` で 1 フレームを
 
 mirakc の `decode=0` は全 TS を配信する。クリアサービスだけを選ぶには
 `mirakc-arib filter-service` などのサービスフィルタが必要（未導入）。
+
+## CS remap 経路（2026-11-14 01:14 JST）
+
+製品が `MIXER/Sink=false` のまま CS キーも効かなかったため、BS で成功している
+`physical TSI0 → logical TSI1` remap を CS に適用して直接 TS を取得した。
+mirakc は停止したまま（再起動なし）。
+
+### 実装
+
+`rust/t4s-tuner/src/main.rs` の `run_2k`:
+
+- 既存の CS: `T4S_CS_TSI_PORT`（既定 0）→ `(port, logical=0, remap=false)`
+- 追加: `T4S_CS_REMAP=1` のとき `(port, logical=1, remap=true)`
+  - `T4S_CS_TSI_PORT` 未指定なら `(0, 1, true)`（BS と同じ経路）
+  - `T4S_CS_TSI_PORT=1` なら `(1, 1, true)`
+- 環境変数なしの既存動作は変更なし。
+
+ビルド・配置:
+
+```text
+cargo build --release --target armv7-unknown-linux-musleabihf -p t4s-tuner
+新 binary: 550,812 bytes, md5 02b495734554844c787f4e6faa23525c
+実機 /mnt/t4s/opt/t4s/bin/t4s-tuner と md5 一致、755
+```
+
+補足: 01:12 頃に実機が自然再起動し（uptime 97 秒）、`/mnt/t4s` が未マウント
+だったため、mirakc を起動せず手動で `/media/usb` と `/mnt/t4s` を mount した。
+
+### 実行結果
+
+```sh
+T4S_CS_REMAP=1 /mnt/t4s/opt/t4s/bin/t4s-tuner \
+  --type CS --channel CS8 --duration 8 - > /tmp/cs2k-remap.ts 2> /tmp/cs2k-remap.log
+```
+
+- **13,484,488 bytes**（0 bytes ではない）
+- 先頭 16 bytes: `47 10 0f 16 70 40 1c ad 45 b0 8a 60 7b 5d d0 e2`（先頭 `0x47`）
+- ログ:
+  - `mkra: opened ISDB-S RF 12411000 TSID 6080 / raw`
+  - `t4s-tuner: CS CS8 -> RF 12411000 kHz TSID 6080`
+- bytes > 0 のため `T4S_CS_TSI_PORT=1` の追加試行は行っていない。
+
+### ffprobe
+
+```text
+format: mpegts / duration 2.60 s / bit_rate 41.46 Mbps
+program 55:  mpeg2video Main 1440x1080, AAC LC 48000 Hz 2ch
+program 218: mpeg2video 0x0, AAC 0 Hz 0ch
+program 318: mpeg2video 0x0
+program 349: mpeg2video 0x0
+scrambled: 38,132 / 71,726 TS packets = 53.16%
+```
+
+program 55 の video PID `0x100F` はスクランブル PID に含まれず、クリア映像
+（MPEG-2 Main 1440x1080 + AAC LC）を確認できた。program 218 の video PID
+`0x100D` はスクランブル PID に含まれ、今回の取得では復号なしの映像は出なかった。
+（過去の §CS 無料/クリアサービス の表では 218 を clear と記録しているが、
+今回の 8 秒取得では 55 が clear、218 は scrambled だった。）
+
+### 終了時の注意
+
+`t4s-tuner` はデータ取得後に以下の cleanup エラーで **rc=1** になった。
+
+```text
+mkra: BS2K cleanup remove PID: No error information (os error 1038)
+mkra: BS2K disconnect needs stop/retry: No error information (os error 1038)
+mkra: BS2K cleanup stop retry: No error information (os error 1038)
+mkra: BS2K cleanup disconnect retry: No error information (os error 1038)
+mkra: BS2K cleanup ring ownership: retaining graph with live writer/readers
+t4s-tuner: graph cleanup failed; refusing to restore the frontend
+```
+
+TS 自体は取得できているが、graph cleanup に失敗して frontend を戻せていない。
+次の選局前に状態確認（必要なら再起動）が必要。
+
+mirakc は停止状態を維持。キー送信・0x6004・電源操作は行っていない。
