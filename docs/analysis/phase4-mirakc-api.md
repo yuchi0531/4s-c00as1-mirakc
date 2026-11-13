@@ -183,3 +183,64 @@ MIXER/Sink=false のまま復帰不能になったため、**ユーザー指示�
    `/api/channels/BS4K/45328/stream?decode=1` を検証。
 4. 高負荷時の mirakc/デバイスクラッシュの原因切り分け
    （API ストリーム中の load average 30+、i2c/xcdrv 競合の可能性）。
+
+---
+
+## 8. 全チャンネル登録と API 検証（2026-11-14 00:38–00:46 JST）
+
+### 8.1 設定反映
+
+`config/config.full.yml` を `config/config.yml` として実機の
+`/mnt/t4s/opt/t4s/config.yml` に反映した。`server.mounts: /www` は維持。
+mirakc は 1 回だけ再起動（pid 1025 → 1196）。t4s-remote は pid 975 のまま。
+
+### 8.2 `/api/channels` — 24 件
+
+HTTP 200。内訳は **BS 6 / CS 12 / BS4K 6**。
+
+```text
+BS   : NHK-BS BS15_0, BS-NTV BS13_0, BS-Asahi BS01_0,
+       BS-TBS BS01_1, BS-Tokyo BS01_2, BS-Fuji BS13_1
+CS   : CS2, CS4, CS6, CS8, CS10, CS12, CS14, CS16, CS18, CS20, CS22, CS24
+BS4K : NHK-BS4K 45328, BS-NTV-4K 45170, BS-Asahi-4K 45168,
+       BS-TBS-4K 45329, BS-Tokyo-4K 45169, BS-Fuji-4K 45330
+```
+
+### 8.3 `/api/services` — 0 件
+
+HTTP 200、`[]`。mirakc ログに以下の警告があり、services DB が未作成。
+`scan-services` は無効のままで、`services.yml` も存在しないため、
+`/api/services` は空になる。`/api/channels` は設定の channels を返すが、
+services の `services` 配列はこの構成では空のまま。
+
+```text
+WARN mirakc_core::epg: Failed to load services err=std::io error:
+No such file or directory (os error 2)
+```
+
+### 8.4 ストリーム検証
+
+製品は 00:38 時点で `MIXER/Sink/buf_buf=true`, SI 141/45170 だった。
+mirakc 再起動後の CS 検証で以下を観測した。
+
+- `GET /api/channels/CS/CS8/stream?decode=0`:
+  - 4 回試行（5–6 秒、`--max-time 6`）。mirakc ログには
+    `Streaming started channel=CS/CS8` / `Streaming stopped` が記録されたが、
+    クライアントには **HTTP 000 / 0 bytes**（接続後にヘッダも届かず）。
+  - BS/BS13_0 decode=1、BS4K/45170 decode=1 は、この後の製品状態悪化を
+    受けて追加検証を中止した。45170 の成功結果は §2 を参照。
+- 検証後の製品 `/api/status`:
+  - `MIXER/Sink/buf_buf=false`
+  - `SI=101/45328`（BSP4K）
+  - `discover=None`
+
+### 8.5 復旧試行
+
+`/mnt/t4s/opt/t4s/bin/t4s-probe send 141 0 0` を 1 回実行したが、
+`si=Some(LiveService { tlv_stream_id: 45328, ... service_id: 101 })` のままで、
+141/45170 へは戻らなかった。`t4s-probe` の `discover` は一時 `Ok((0,0,8))` に
+なったが、最終的に製品は `MIXER/Sink=false` のまま。キー送信は行っていない。
+
+**現状**: `/api/channels` は 24 件、`/api/services` は `[]`、mirakc は稼働中。
+製品 UI は 45328/101 の失敗状態で、電源再投入またはユーザー操作による復旧が必要。
+

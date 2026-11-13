@@ -43,6 +43,55 @@ channels:
     channel: BS13_1
     services: [181, 182, 183]
 
+  - name: CS2
+    type: CS
+    channel: CS2
+    services: [296, 298, 299, 339]
+  - name: CS4
+    type: CS
+    channel: CS4
+    services: [250, 292, 301, 323]
+  - name: CS6
+    type: CS
+    channel: CS6
+    services: [294, 324, 329, 331, 340, 341, 354, 363]
+  - name: CS8
+    type: CS
+    channel: CS8
+    services: [55, 218, 318, 349]
+  - name: CS10
+    type: CS
+    channel: CS10
+    services: [219, 317, 800, 801]
+  - name: CS12
+    type: CS
+    channel: CS12
+    services: [254, 325, 330, 343]
+  - name: CS14
+    type: CS
+    channel: CS14
+    services: [227, 293, 310, 342]
+  - name: CS16
+    type: CS
+    channel: CS16
+    services: [290, 311, 316, 321, 333, 353]
+  - name: CS18
+    type: CS
+    channel: CS18
+    services: [240, 262, 305, 314]
+  - name: CS20
+    type: CS
+    channel: CS20
+    services: [307, 308, 309, 322]
+  - name: CS22
+    type: CS
+    channel: CS22
+    services: [161, 297, 312, 351]
+  - name: CS24
+    type: CS
+    channel: CS24
+    services: [223, 257, 295, 300]
+
   - name: NHK-BS4K
     type: BS4K
     channel: '45328'
