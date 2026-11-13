@@ -74,6 +74,8 @@
   .power-red:hover { background: linear-gradient(180deg, #d04534, #9c2a1d); }
   .accent { background: linear-gradient(180deg, #3d6cff, #2a4fd0); border-color: #6d91ff; font-weight: 600; }
   .accent:hover { background: linear-gradient(180deg, #4d7bff, #3159e0); }
+  .danger { border-color: #e05545; }
+  .warn { color: #ffb56b; font-size: 12px; margin: 8px 0 0; line-height: 1.6; }
   .muted-key { color: var(--muted); }
   .dpad {
     display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px;
@@ -124,7 +126,7 @@
 <header>
   <h1>4S-C00AS1 <span>Remote</span></h1>
   <div class="head-tools">
-    <span id="pill" class="pill">v2026-11-14a · 未接続</span>
+    <span id="pill" class="pill">v2026-11-14b · 未接続</span>
     <button id="status-btn" class="small">status</button>
   </div>
 </header>
@@ -139,6 +141,7 @@
       <button data-code="287" data-name="RC_SETUP_MENU">設定</button>
       <button data-code="97" data-name="RC_EPG">EPG</button>
       <button data-code="19" data-name="RC_INFO">情報</button>
+      <button class="accent" data-code="100" data-name="RC_END">終了（通知を消す）</button>
     </div>
   </section>
 
@@ -147,7 +150,8 @@
     <div class="dpad">
       <button class="up" data-code="22" data-name="RC_UP">↑</button>
       <button class="left" data-code="24" data-name="RC_LEFT">←</button>
-      <button class="enter" data-code="21" data-name="RC_ENTER">決定</button>
+      <button class="enter danger" data-code="21" data-name="RC_ENTER"
+              title="更新通知が出ているときは押さないでください">決定</button>
       <button class="right" data-code="25" data-name="RC_RIGHT">→</button>
       <button class="down" data-code="23" data-name="RC_DOWN">↓</button>
     </div>
@@ -155,6 +159,9 @@
       <button data-code="37" data-name="RC_BACK">戻る</button>
       <button data-code="20" data-name="RC_SELECT">選局</button>
     </div>
+    <p class="warn">⚠ 決定（ENTER 0x015）は、更新通知が出ているときは押さないでください
+      （ファームウェア更新・再起動の恐れ）。通知は「終了（0x064）」で消せます。
+      通知がモーダル表示中の間は INFO / EPG も吸われます。</p>
   </section>
 
   <section class="panel">
@@ -233,7 +240,7 @@
 </main>
 
 <footer>
-  <code>UI v2026-11-14a</code> · <code>msgId 0x12044</code> ·
+  <code>UI v2026-11-14b</code> · <code>msgId 0x12044</code> ·
   <strong>認証なし・LAN 専用。</strong>
   <code>0.0.0.0:8484</code> を信頼できるネットワーク内でのみ公開してください。
   リモコン受光部が壊れているため、この UI は Q_UIM (qid 0x7F, msg 0x12044) に
@@ -248,7 +255,7 @@
   const pill = document.getElementById('pill');
   const statusline = document.getElementById('statusline');
   const MAX_LOG = 80;
-  const UI_VERSION = '2026-11-14a';
+  const UI_VERSION = '2026-11-14b';
 
   const hex = (code) => '0x' + Number(code).toString(16).padStart(3, '0').toUpperCase();
   const clock = () => new Date().toTimeString().slice(0, 8);
@@ -297,6 +304,17 @@
 
   async function sendKey(code, opts = {}, button = null) {
     const label = nm(code);
+    if (code === 0x15) {
+      const ok = window.confirm(
+        '決定（ENTER 0x015）は危険です。\n' +
+        '更新通知が出ているときは押さないでください（ファーム更新・再起動の恐れ）。\n' +
+        '通知は「終了（0x064）」で消せます。\n\n本当に送信しますか？'
+      );
+      if (!ok) {
+        statusline.textContent = '決定（ENTER）をキャンセルしました。「終了」で通知を消してください';
+        return;
+      }
+    }
     const t0 = performance.now();
     if (button) button.disabled = true;
     statusline.textContent = `送信中: ${label} ${hex(code)} …`;
@@ -354,6 +372,13 @@
   async function runMacro(name) {
     const macro = MACROS[name];
     if (!macro) return;
+    if (macro.steps.some((s) => s.code === 0x15)) {
+      const ok = window.confirm(
+        'このマクロは決定（ENTER 0x015）を含みます。\n' +
+        '更新通知が出ているときは実行しないでください。実行しますか？'
+      );
+      if (!ok) return;
+    }
     const buttons = [...document.querySelectorAll('[data-macro]')];
     buttons.forEach((b) => (b.disabled = true));
     const t0 = performance.now();

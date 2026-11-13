@@ -35,11 +35,14 @@ const MSG_KEY: u32 = 0x1_2044;
 /// accepted by UIM, but `0x12044` is the front-panel path and the default.
 const MSG_KEY_FALLBACK: u32 = 0x1_115C;
 /// Shown in the UI footer / status so a stale browser tab is obvious.
-const BUILD: &str = "2026-11-14a";
+const BUILD: &str = "2026-11-14b";
 const MSGH_LIST: &str = "/tmp/bdh_out_msgh.lst";
 const LOG_PATH: &str = "/tmp/t4s-remote.log";
 const PID_PATH: &str = "/tmp/t4s-remote.pid";
-const PRESS_HOLD: Duration = Duration::from_millis(80);
+/// Press-to-release hold.  80 ms was too short for the product to register
+/// presses reliably (notably the notification-dismiss `RC_END`).  Override
+/// with `--hold-ms`; 20..=1000 ms is accepted.
+const DEFAULT_HOLD_MS: u64 = 200;
 const MAX_BODY: usize = 16 * 1024;
 const MAX_STEPS: usize = 64;
 const MAX_STEP_DELAY_MS: u64 = 5_000;
@@ -64,12 +67,14 @@ struct SendState {
 
 struct State {
     send: Mutex<SendState>,
+    hold_ms: u64,
 }
 
 impl State {
-    fn new() -> Self {
+    fn new(hold_ms: u64) -> Self {
         State {
             send: Mutex::new(SendState::default()),
+            hold_ms,
         }
     }
 }
@@ -220,7 +225,7 @@ fn inject(state: &State, code: u32, kind: u32, release: bool) -> io::Result<Sent
         if release { "" } else { " (hold, no release)" }
     ));
     if release {
-        std::thread::sleep(PRESS_HOLD);
+        std::thread::sleep(Duration::from_millis(state.hold_ms));
         raw(code, 2)?;
     }
     send.last_press = Some(code);
@@ -772,6 +777,7 @@ fn status_json(state: &State) -> String {
     );
     let fields = [
         format!("\"build\":\"{BUILD}\""),
+        format!("\"hold_ms\":{}", state.hold_ms),
         format!("\"now\":{now}"),
         format!("\"time\":\"{}\"", hms(now)),
         format!("\"uptime_s\":{uptime}"),
@@ -833,10 +839,11 @@ fn handle_conn(mut stream: TcpStream, state: Arc<State>) {
     }
 }
 
-fn parse_args() -> Result<(String, u16, bool), String> {
+fn parse_args() -> Result<(String, u16, bool, u64), String> {
     let mut bind = "0.0.0.0".to_string();
     let mut port = 8484u16;
     let mut daemon = false;
+    let mut hold_ms = DEFAULT_HOLD_MS;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -851,23 +858,38 @@ fn parse_args() -> Result<(String, u16, bool), String> {
                     .next()
                     .ok_or_else(|| "--bind needs a value".to_string())?;
             }
+            "--hold-ms" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "--hold-ms needs a value".to_string())?;
+                hold_ms = value
+                    .parse()
+                    .map_err(|_| format!("invalid hold-ms {value}"))?;
+                if !(20..=1000).contains(&hold_ms) {
+                    return Err(format!("hold-ms {hold_ms} is outside 20..=1000"));
+                }
+            }
             "--daemon" | "-d" => daemon = true,
             "--help" | "-h" => {
-                println!("usage: t4s-remote [--port 8484] [--bind 0.0.0.0] [--daemon]");
+                println!(
+                    "usage: t4s-remote [--port 8484] [--bind 0.0.0.0] [--hold-ms 200] [--daemon]"
+                );
                 std::process::exit(0);
             }
             other => return Err(format!("unknown argument {other}")),
         }
     }
-    Ok((bind, port, daemon))
+    Ok((bind, port, daemon, hold_ms))
 }
 
 fn main() {
-    let (bind, port, daemon) = match parse_args() {
+    let (bind, port, daemon, hold_ms) = match parse_args() {
         Ok(values) => values,
         Err(e) => {
             eprintln!("t4s-remote: {e}");
-            eprintln!("usage: t4s-remote [--port 8484] [--bind 0.0.0.0] [--daemon]");
+            eprintln!(
+                "usage: t4s-remote [--port 8484] [--bind 0.0.0.0] [--hold-ms 200] [--daemon]"
+            );
             std::process::exit(2);
         }
     };
@@ -889,12 +911,12 @@ fn main() {
     let _ = std::fs::write(PID_PATH, format!("{}\n", std::process::id()));
     log(&format!(
         "t4s-remote pid={} build={BUILD} listening on {bind}:{port} \
-         (Q_UIM qid {Q_UIM:#x}, msg {MSG_KEY:#x}, fallback {MSG_KEY_FALLBACK:#x})",
+         (Q_UIM qid {Q_UIM:#x}, msg {MSG_KEY:#x}, fallback {MSG_KEY_FALLBACK:#x}, hold {hold_ms} ms)",
         std::process::id()
     ));
     log("unauthenticated LAN-only remote; primer is inserted per key as needed");
 
-    let state = Arc::new(State::new());
+    let state = Arc::new(State::new(hold_ms));
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
