@@ -10,7 +10,7 @@
 
 | 目的 | 結果 |
 |---|---|
-| 1. 既存 ioctl で ARC に 32B の FDC/TSin メッセージを渡す | **部分達成**。汎用 32B パススルーは無い。ただし `ioctl 0x78` が **12B の生ペイロード**を ARC の `s_dev_com` に載せる唯一の入口。`0x50/0x52/0x53` も同じ `general_cmd` 経由で ARC に届く（構造化ペイロード）。 |
+| 1. 既存 ioctl で ARC に 32B の FDC/TSin メッセージを渡す | **不可**。汎用 32B パススルーは無い。`ioctl 0x78` は 12B を載せるが、`general_ctrl_cmd` が `word2` を物理バッファとして `flush_dcache` するため、ユーザが用意した任意アドレスでは **kernel oops**（実機で 3 回確認）。`0x50/0x52/0x53` は `general_cmd` 経由で ARC に届く（構造化ペイロード）。 |
 | 2. ARC700 raw FW の dispatcher 特定 | **未達**。FW は base 0 の ARCompact。`ConnectTsUnits` / `0x10010010` という文字列・即値は FW に存在しない。`ConnectInBuf` は AVD(ES) の入力バッファ接続で、TLV 入力とは別物。ARC 用の実用的な逆アセンブラが無く、cmd 0x78 のハンドラは未特定。 |
 | 3. type 0x24 に明示 input を接続する別経路 | **現状無し**。type 0x24 は `n_in=0` で `connect_input` 対象外。crossbar (`cmd 0x53` → `0x61f0`) が候補だが、書込み主体（kernel `config_tsi` か ARC か）は未確定。 |
 | 4. t4s-probe へ追加できる具体仕様 | **あり**。§5 に ioctl 0x78 の 12B 仕様、§6 に FDC の正しい送信仕様（ただし abs 宛）、§7 に TSI crossbar 仕様を記載。 |
@@ -178,6 +178,12 @@ ioctl(fd, (sub << 16) | 0x78, &req, 12);
 - `sub` は `s_dev_com` の +0x14 に入る。0 が無難。
 - 戻り値は **ARC の応答ではなく、キュー投入の成否**
   （0 = 投入成功、`0xfffffd18` = timeout、`0xfffffd17` = エラー）。
+- **重大な注意**: `general_ctrl_cmd` の 0x78 分岐は `word2` を物理アドレス、
+  `word1` を長さとして `flush_dcache` に渡す。`word2=0` は
+  `v7_flush_kern_dcache_area` で kernel oops する（実機で確認）。
+  XCode アパーチャの SBUF リング PA でも oops した。
+  **ユーザ空間から任意の 12B を安全に送る手段としては使えない。**
+  詳細は §12。
 - ARC 側の cmd 0x78 ハンドラの意味は未確定（§4）。
 - 12 バイトを超えるペイロードは **この ioctl では送れない**。
   `req+0x8b8` は handler が 12 に固定するため、ユーザが大きくても切り捨て。
@@ -357,7 +363,12 @@ pub fn cust_msg(&self, word0: u32, word1: u32, word2: u32, sub: u16) -> io::Resu
   - その他 = `check_fw_status` 等のエラー
 - 失敗時は **ARC に何も渡っていない**。再送しない。
 
-### 5.2 実機試験マトリクス（1 回ずつ、間を 2 秒以上）
+### 5.2 実機試験マトリクス（**実行しない**）
+
+> 2026-11-13 の実機試験で `word2=0` は kernel oops した（§12）。
+> 以下の表は「もしベンダ内部の有効なバッファハンドルが得られた場合」の
+> 記録であり、現状の `t4s-arc` は `word2=0` を拒否してダミーページを
+> 差し込むが、それでも oops する。再実行禁止。
 
 `sub = 0` 固定、`word2 = 0` から開始。
 
@@ -539,3 +550,71 @@ ioctl(fd, (0u16 << 16) | 0x53, &cfg, 44);
 各試験の前後で保存するもの:
 `0x6000`, `0x6008`, `0x600c`, `0x61f0`, `/proc/sysvipc/msg`,
 `/tmp/bdh_out_msgh.lst`, `dmesg`, `tlvcap2` の `first`/`total`。
+
+---
+
+## 12. Phase 4 実機追記（2026-11-13）
+
+実装: `rust/t4s-arc`（workspace member、`t4s-core` 依存）。armv7 musl static。
+配置: `/mnt/t4s/opt/t4s/bin/t4s-arc`。
+サブコマンド: `custmsg`, `tsi-read`, `tsi-ex`, `destroy-buffer`。
+
+### 12.1 `custmsg` は安全に使えない（kernel oops）
+
+`0x78` の 12B は「生パススルー」ではなかった。`general_ctrl_cmd` は
+`word2` を物理アドレス、`word1` を長さとして `flush_dcache` に渡す。
+実機では次の 3 通りすべてで `v7_flush_kern_dcache_area` が oops し、
+`t4s-arc` は SIGSEGV (139) で終了した。
+
+| # | word2 | 結果 |
+|---:|---|---|
+| 1 | `0x00000000` | oops（`flush_dcache+0x28` → `v7_flush_kern_dcache_area+0x20`） |
+| 2 | SBUF ring PA `0x28e59000`（XCode アパーチャ） | 同じ oops |
+| 3 | `/proc/self/pagemap` の匿名ページ PA `0x6853e000`（System RAM） | 同じ oops |
+
+- いずれも `ioctl` の戻り値は得られず、`dmesg` に
+  `---[ end trace e740039385d7eab3 ]---`（同 `ab5`, `ab6`）が残った。
+- 3 回の oops 後もカーネル・`mirakc`（pid 1613）・`abs`/`adsb` は生存。
+  reboot は不要だった。
+- `word0=0x10010010` は **送っていない**。送れば同じ oops になる。
+- `word2` にベンダ内部の正しいバッファ記述（`xcode_handle+0x4c0` 経由の
+  ハンドル）が無い限り、この cmd はユーザ空間から使えない。
+  `general_cmd` の設計意図は「ドライバ所有バッファの DMA 指定」であり、
+  汎用メッセージ入口ではない。
+- 最終版の `t4s-arc` は `word2=0` を **ioctl 前に拒否** する（fail-closed）。
+  実行結果: `cmd 0x78 requires a driver-owned physical buffer in word2; ... Refusing to send.`（rc=1）。
+  これ以上の 0x78 試行は行っていない。
+- 試験中に作った SBUF ring `0x28d66d00`（`0x1000`）は
+  `destroy-buffer 0x28d66d00` で `force_reset_buffer` + `destroy_buffer` に
+  成功し、graph の `buf[4]` は `h=0x0` に戻った。
+
+### 12.2 `tsi-ex` は成功（1 段変更 → 完全復元）
+
+`t4s-arc tsi-ex 0 0 1`（logical 0 → physical 1、packet 0）:
+
+```
+before: 0x6000=0x00000100 0x6008=0x01000000 0x600c=0x00000300 0x61f0=0x00000010
+ioctl 0x53 req=[0,0,0,1,0,0,1,0,1,0,1]
+ioctl 0x53 rc=0 status=0
+after:  0x6000=0x02000100 0x6008=0x03000200 0x600c=0x00000100 0x61f0=0x00000011
+restore: 0x53 port1/asi1, then 0x53 port0/asi0
+restored: 0x6000=0x00000100 0x6008=0x01000000 0x600c=0x00000300 0x61f0=0x00000010
+```
+
+- `0x61f0`: `0x10` → `0x11`（nibble0 が 0→1）→ `0x10`。
+- `0x6000/8/c` も保存値へ完全一致。`restore verified` を出力。
+- 復元は kernel の `config_tsi` 相当を 0x53 で 2 回（port1/asi1, port0/asi0）
+  呼ぶ方式。MMR への直接 write は行っていない。
+- `tsi-ex` 実行後の `t4s-probe graph`: `mmr6000=0x100 mmr6008=0x1000000
+  mmr600c=0x300 mmr61f0=0x10`、device 11 個（type 0x24 が 2 個、
+  type 0x25 が 4 個）は実行前と同じ。TLV ring の追加・消失は無し。
+- TLV の実データは取得できていない。4K 選局（TUM `0x6004`）は
+  `state/op` 表 `0x395f60` のゲートが閉じたままで、`tlvcap3` は
+  タスク指示により使わないため。
+
+### 12.3 実機状態（試験後）
+
+- `mirakc` pid 1613 は生存。`t4s-probe graph` は正常応答。
+- `0x61f0` は `0x10`、`0x6000/8/c` は試験前値。
+- reboot / mirakc 再起動は行っていない（必要なかった）。
+- 0x01 (halt), 0x6001/2, ptrace, abs 停止は行っていない。

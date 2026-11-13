@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["t4s-core", "t4s-tuner", "t4s-cas", "t4s-probe", "t4s-call"]
+members = ["t4s-core", "t4s-tuner", "t4s-cas", "t4s-probe", "t4s-call", "t4s-arc"]
 
 [workspace.package]
 edition = "2021"
