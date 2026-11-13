@@ -266,3 +266,86 @@ BS テストは実施せず、追加のキー送信・0x6004 も行っていな�
 
 **要・電源再投入**。再起動後に graph が初期化された状態で、
 CS 既定（remap）と BS を 10 秒間隔で再テストする。
+
+## 再起動後の再テスト（2026-11-14 01:39–01:40 JST）
+
+ユーザーによる電源再投入後（uptime 70.79 秒）、mirakc を起動せず手動で
+`/media/usb` と `/mnt/t4s` を mount した。バイナリは
+`552,388 bytes / md5 01cfa56831ff28cfc6c0a05ecb8e90ed`。
+
+状態確認:
+
+```text
+t4s-probe isdbs: lock=8, bank2=[0,0,8]
+t4s-probe restore-tsi: 61f0=0x10（identity、変更なし）
+```
+
+### CS 新既定（remap）
+
+```sh
+t4s-tuner --type CS --channel CS8 --duration 8 - > /tmp/cs8.ts 2> /tmp/cs8.log
+```
+
+- **rc=1**
+- **13,190,268 bytes**
+- 先頭 16 bytes: `47 1f ff 10 ff ff ff ff ff ff ff ff ff ff ff ff`
+- cleanup ログ:
+
+```text
+mkra: BS2K remove PID retry: No error information (os error 1038)
+mkra: BS2K cleanup remove PID: ignored benign error: ... 1038
+mkra: BS2K disconnect needs stop/retry: ... 1038
+mkra: BS2K cleanup stop retry: ... 1038
+mkra: BS2K cleanup stop retry: ignored benign error: ... 1038
+mkra: BS2K cleanup disconnect retry: ignored benign error: ... 1038
+mkra: BS2K cleanup ring ownership: retaining graph with live writer/readers
+mkra: BS2K cleanup stop: ignored benign error: ... 1038
+mkra: BS2K cleanup destroy DEMUX: ignored benign error: ... 1038
+TSI rollback: configuration MMRs and identity mapping exactly restored
+t4s-tuner: frontend restore warning: unrecognised tuner ELF; refusing fixed-address process access
+t4s-tuner: frontend restore failed: unrecognised tuner ELF; refusing fixed-address process access
+```
+
+1038 は benign として無視でき、TSI rollback も成功したが、ring が live のまま
+残り、`restore_frontend()` は tuner ELF 検証で失敗した。
+**rc=0 / frontend 復元成功には至っていない。**
+
+ffprobe:
+
+```text
+container: mpegts / duration 1.94 s / bit_rate 54.36 Mbps
+program 55:  mpeg2video Main 1440x1080 + AAC LC 48000 Hz 2ch（clear, PID 0x100F）
+program 218: mpeg2video 0x0 + AAC 0Hz（PID 0x100D は scrambled）
+program 318/349: 0x0
+scrambled: 38,068 / 70,161 packets = 54.26%
+```
+
+### BS（10 秒後）
+
+```sh
+t4s-tuner --type BS --channel BS13_0 --duration 8 - > /tmp/bs.ts 2> /tmp/bs.log
+```
+
+- **rc=1 / 0 bytes / 先頭なし**
+- ログ:
+
+```text
+physical TSI config request ...
+logical TSI1 to physical TSI0 config_ex ...
+restore logical TSI1 identity and physical TSI1 ...
+TSI rollback: configuration MMRs and identity mapping exactly restored
+t4s-tuner: ISDB-S open: No error information (os error 1038)
+```
+
+CS 終了時の ring が live のまま残ったため、BS の `Source::open` が
+DEMUX 構築で 1038 になり、TS は取得できなかった。
+
+### 結論
+
+- cleanup の 1038 無視・再試行・TSI rollback は動作した。
+- ただし ring が live のまま残り、frontend restore は
+  `verify_layout` の OEM ELF 不一致で失敗する。
+- この実機では `restore_frontend()` のプロセスメモリ経由の復元が使えない。
+  別の復元経路（プロセスメモリを使わない device assign のみ等）を検討する必要がある。
+- BS 取得前に graph/ring を確実に破棄する追加対応も必要。
+- 次のテスト前に再度電源再投入が必要。
