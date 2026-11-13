@@ -114,3 +114,21 @@ qid 0x36F へ送った。結果:
 4K グラフを破棄する方向に働いた。再試験する前に、E0 の read-only ゲート判定
 （`bAdsbInitialized`, adsb `.bss 0x395f60` の 55 バイト、`0x395dd4+dev*0x168+4`）
 と `0x6001` の mode 値、`0x6002` の送信元/応答条件を確定する必要がある。
+
+## Phase 2b E0（reboot 後の read-only）
+
+reboot 後:
+- `abs` `bAdsbInitialized` = **1**
+- `adsb` の state/op 表 `0x395f60` は **非ゼロ**（TUM 初期化済み）
+- per-device block `0x395dd4 + dev*0x168`:
+  - dev0: `ff 00 00 00 01 00 00 00 00 00 00 00 64 00 00 00 09 00 00 00 00 00 00 00`
+  - dev1: `01 00 00 00 01 00 00 00 00 00 00 00 05 00 00 00 05 00 00 00 09 00 00 00`
+
+つまり TUM は初期化済み。しかし **0x6004 だけ**を送ると bank2 は
+`0x6080`（CS8）のまま。0x6004 は per-device block を更新せず、
+既存 block を `0x5004` として再送するため、**チャンネル変更にならない**。
+
+4K 選局には per-device block の更新（`0x6005`/UI 経路）か、
+`fdc_chmConnectTsUnits` の ARC メッセージ `0x10100010`
+（payload `{queue_id, handle, source, tsdNo, op=5}`）が必要。
+どちらも body/queue の意味が未確定で、製品停止/ARC 解析の領域。
