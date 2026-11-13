@@ -53,6 +53,59 @@ fn graph_dump(drv: &Arc<XcDrv>) {
 fn main() {
     let arg = std::env::args().nth(1).unwrap_or_default();
     let drv = Arc::new(XcDrv::open_path(t4s_core::xcdrv::DEV_PATH).expect("driver"));
+    if arg == "tlvcap2" {
+        // 1) Clear the stale 2K TLV-output bit if present.
+        let regs = t4s_core::gr_i2c::read_output_regs().expect("regs");
+        let cc = regs.bank0.iter().find(|(r, _)| *r == 0xcc).map(|(_, v)| *v).unwrap_or(0);
+        println!("cc_before={cc:#04x}");
+        if cc & 0xc0 == 0xc0 {
+            match t4s_core::gr_i2c::select_tlv_output_exclusive() {
+                Ok(v) => println!("tlv exclusive {:#x}->{:#x}", v.before, v.after),
+                Err(e) => println!("tlv exclusive ERR {e}"),
+            }
+        }
+        // 2) Tune 4K through the product's ADSB queue (sets TSin routing).
+        let (tsid, freq, bid) = channels::tuning_record(141).expect("141");
+        let t = tuner::Tuner::open_qid(tuner::ADSB_COMM_QID, tuner::MSGH_LIST).expect("adsb q");
+        t.change_channel(&tuner::ChangeChannelRequest {
+            oid: 0x51, tune: tuner::TUNE_CHANNEL_CHANGE, not_decode: 0,
+            service_id: 141, freq_khz: freq, tlv_stream_id: tsid, bid,
+        }).expect("change141");
+        println!("sent 141 tsid={tsid:#06x} rf={freq}");
+        std::thread::sleep(Duration::from_secs(5));
+        // 3) Find the product TLV device (type 0x24) and attach our own ring.
+        let g = t4s_core::graph::Graph::read().expect("graph");
+        let tlv = g.tables.get("device").unwrap().2.iter()
+            .find(|r| r.words[1] == 0x24).map(|r| r.words[0]).expect("tlv dev");
+        let mut ring = 0u32; let mut conn = 0u32; let mut src = None;
+        let mut result = String::new();
+        let run = (|| -> Result<(), String> {
+            ring = drv.create_tlv_capture_ring(0x400000).map_err(|e| format!("ring: {e}"))?;
+            conn = drv.connect_output(tlv, ring).map_err(|e| format!("connect: {e}"))?;
+            drv.set_buffer_ready(ring).map_err(|e| format!("ready: {e}"))?;
+            let reader = drv.create_reader(ring).map_err(|e| format!("reader: {e}"))?;
+            let mut s = t4s_core::tssrc::XcReaderSource::adopt(Arc::clone(&drv), ring, reader, 500);
+            let begin = Instant::now();
+            let mut total = 0usize; let mut first = Vec::new();
+            while begin.elapsed() < Duration::from_secs(3) {
+                let mut buf = Vec::new();
+                match s.read_into(&mut buf) {
+                    Ok(_) => { total += buf.len(); if first.len() < 64 { first.extend_from_slice(&buf); } }
+                    Err(e) => { result = format!("read ERR {e}"); break; }
+                }
+            }
+            let (n, _) = t4s_core::graph::tlv_score(&first);
+            result = format!("tlv={tlv:#x} total={total} first={:02x?} tlv_chain={n}", first);
+            src = Some(s);
+            Ok(())
+        })();
+        if let Err(e) = run { result = format!("ERR {e}"); }
+        drop(src);
+        if conn != 0 { let _ = drv.disconnect(tlv, conn); }
+        if ring != 0 { let _ = drv.force_reset_buffer(ring); let _ = drv.destroy_buffer(ring); }
+        println!("tlvcap2 {result}");
+        return;
+    }
     if arg == "tlvcap" {
         // Power the LNB through the 2K frontend, then tune ADBS directly.
         let fem = tuner::Tuner::open(tuner::MSGH_LIST).expect("fem");

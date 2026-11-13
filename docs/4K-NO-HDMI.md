@@ -75,3 +75,25 @@ TS_RECODER は 188 バイト TS 専用で、TLV の 130 バイトリングは受
 `connect_output`（8 output ports）だが、TLV demux に選局入力/ロックが
 無いため 0 バイト。TLV demux の入力構成（0xA31002A の再現）と
 `bAdsbInitialized` の正しい実アドレスが Phase 2 の課題。
+
+## Phase 2 実機試験（2026-11-13 深夜）
+
+`adsb` の TLV トポロジ（type 0x24、`0xA31002A`、4MiB RING/MMTP(9) 4本、
+type 0x25 MMT demux）を `docs/analysis/phase2-tlv.md` に確定。
+
+実機では次を試した:
+
+1. `0xcc=0x40`（既に TLV 出力ビット）を確認。
+2. qid 0x36F へ `0x6004`（service 141）を直接送信。
+3. type 0x24 に **RING/SYSTEM/MMTP(9), 4MiB, max_reader=1** の
+   自前リングを `connect_output` し、3秒 read。
+
+結果: `tlv_chain=0`、0 バイト。送信後の復調は `lock=0x48` だが
+bank2 は **0x6080（CS8 の TSID）** のままで、141 へ選局されていなかった。
+すなわち直接 `0x6004` は adsb の TUM/TSin 経路を動かしていない。
+
+次に必要なのは `Sfd_TsdSetTsIn`（qid 0x52 msg 0x1e）の body 特定、
+または `bAdsbInitialized` を製品自身に立てさせる初期化列。
+`bAdsbInitialized` の実アドレスは `abs:0x02027184`（RW LOAD 内）で
+再解析済みだが、直接 `0x6004` を送るだけでは 4K 選局/TLV 入力に
+到達しなかった。

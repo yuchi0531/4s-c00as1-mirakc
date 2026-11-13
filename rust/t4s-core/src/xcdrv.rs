@@ -762,6 +762,16 @@ impl XcDrv {
     }
 
     /// RING / SYSTEM / TS, matching `ts_input_t::detect_stream` exactly.
+    /// RING/SYSTEM/MMTP(9) capture ring matching adsb's TLV topology.
+    pub fn create_tlv_capture_ring(&self, units: u32) -> io::Result<u32> {
+        let mut req = [3u32, 1, 9, 1, 0x1000, units, 1, 3, 0];
+        unsafe { self.call(SBUF_CREATE, &mut req)? };
+        if req[8] == 0 {
+            return Err(io::Error::other("TLV capture ring returned handle 0"));
+        }
+        Ok(req[8])
+    }
+
     /// RING buffer with an explicit unit size, used for raw TLV (130 bytes).
     pub fn create_ring(&self, unit_size: u32, units: u32, media_type: u32, max_reader: u32) -> io::Result<u32> {
         let mut req = [3u32, media_type, 0, max_reader, 0x1000, units, unit_size, 3, 0];
