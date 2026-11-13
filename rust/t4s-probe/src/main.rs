@@ -53,6 +53,22 @@ fn graph_dump(drv: &Arc<XcDrv>) {
 fn main() {
     let arg = std::env::args().nth(1).unwrap_or_default();
     let drv = Arc::new(XcDrv::open_path(t4s_core::xcdrv::DEV_PATH).expect("driver"));
+    if arg == "raw6004" {
+        let dev: u32 = std::env::args().nth(2).and_then(|v| v.parse().ok()).unwrap_or(0);
+        let (tsid, freq, bid) = channels::tuning_record(141).expect("141");
+        let words = [dev, 0x71, 9, 0, 0x0b, 141, freq, u32::from(tsid), 0, u32::from(bid)];
+        match tuner::send_raw_message(tuner::ADSB_COMM_QID, 0x6004, 0x28, &words) {
+            Ok(()) => println!("raw6004 dev={dev} sent"),
+            Err(e) => println!("raw6004 ERR {e}"),
+        }
+        std::thread::sleep(Duration::from_secs(8));
+        match t4s_core::gr_i2c::read_output_regs() {
+            Ok(r) => println!("after lock={:#x} bank2={:?} cc={:?}", r.lock,
+                r.bank2_selection, r.bank0.iter().find(|(x,_)| *x==0xcc).map(|(_,v)|*v)),
+            Err(e) => println!("regs ERR {e}"),
+        }
+        return;
+    }
     if arg == "adsbinit" {
         // Product's own TUM initialization sequence, then 0x6004.
         let mode: u32 = std::env::args().nth(2).and_then(|v| v.parse().ok()).unwrap_or(0);
