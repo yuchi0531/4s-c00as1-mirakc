@@ -275,6 +275,28 @@ pub fn parse_msgh_list(text: &str, qid: u32) -> Option<c_int> {
     None
 }
 
+/// Send a raw 10-word ADSB COMM message.  Used for the product's own
+/// initialization messages (0x6001 / 0x6002) before 0x6004.
+pub fn send_raw_message(qid: u32, msg_id: u32, len: u32, words: &[u32]) -> io::Result<()> {
+    let msqid = resolve_msqid(qid, MSGH_LIST)?;
+    let mut m = SysVWire::new(msg_id, len);
+    for (i, w) in words.iter().take(16).enumerate() {
+        m.put_u32(i * 4, *w);
+    }
+    let rc = unsafe {
+        sys::msgsnd(
+            msqid,
+            &m as *const SysVWire as *const c_void,
+            MSGSZ,
+            sys::IPC_NOWAIT,
+        )
+    };
+    if rc < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// A tune addressed straight at one frontend decoder, skipping the FEM.
 ///
 /// This is the non-4K route implemented here. The recovered library entry point

@@ -53,6 +53,38 @@ fn graph_dump(drv: &Arc<XcDrv>) {
 fn main() {
     let arg = std::env::args().nth(1).unwrap_or_default();
     let drv = Arc::new(XcDrv::open_path(t4s_core::xcdrv::DEV_PATH).expect("driver"));
+    if arg == "adsbinit" {
+        // Product's own TUM initialization sequence, then 0x6004.
+        let mode: u32 = std::env::args().nth(2).and_then(|v| v.parse().ok()).unwrap_or(0);
+        match tuner::send_raw_message(tuner::ADSB_COMM_QID, 0x6001, 4, &[mode]) {
+            Ok(()) => println!("sent 0x6001 mode={mode}"),
+            Err(e) => { println!("0x6001 ERR {e}"); return; }
+        }
+        std::thread::sleep(Duration::from_secs(4));
+        match tuner::send_raw_message(tuner::ADSB_COMM_QID, 0x6002, 0, &[]) {
+            Ok(()) => println!("sent 0x6002"),
+            Err(e) => println!("0x6002 ERR {e}"),
+        }
+        std::thread::sleep(Duration::from_secs(1));
+        let (tsid, freq, bid) = channels::tuning_record(141).expect("141");
+        let t = tuner::Tuner::open_qid(tuner::ADSB_COMM_QID, tuner::MSGH_LIST).expect("q");
+        match t.change_channel(&tuner::ChangeChannelRequest {
+            oid: 0x61, tune: tuner::TUNE_CHANNEL_CHANGE, not_decode: 0,
+            service_id: 141, freq_khz: freq, tlv_stream_id: tsid, bid,
+        }) {
+            Ok(()) => println!("sent 0x6004 141 tsid={tsid:#06x}"),
+            Err(e) => println!("0x6004 ERR {e}"),
+        }
+        std::thread::sleep(Duration::from_secs(10));
+        match t4s_core::gr_i2c::read_output_regs() {
+            Ok(r) => println!("after lock={:#x} bank2={:?} cc={:?}", r.lock,
+                r.bank2_selection, r.bank0.iter().find(|(x,_)| *x==0xcc).map(|(_,v)|*v)),
+            Err(e) => println!("regs ERR {e}"),
+        }
+        // Reuse the TLV tap from tlvcap2 by invoking it as a separate process.
+        println!("run tlvcap2 next");
+        return;
+    }
     if arg == "tlvcap2" {
         // 1) Clear the stale 2K TLV-output bit if present.
         let regs = t4s_core::gr_i2c::read_output_regs().expect("regs");

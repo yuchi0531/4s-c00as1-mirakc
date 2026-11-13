@@ -97,3 +97,20 @@ bank2 は **0x6080（CS8 の TSID）** のままで、141 へ選局されてい�
 `bAdsbInitialized` の実アドレスは `abs:0x02027184`（RW LOAD 内）で
 再解析済みだが、直接 `0x6004` を送るだけでは 4K 選局/TLV 入力に
 到達しなかった。
+
+## Phase 2b 実機試験（0x6001/0x6002 初期化）
+
+Phase 2b の推奨列 `0x6001(mode=0) → 0x6002 → 0x6004(141)` を
+qid 0x36F へ送った。結果:
+
+- `0x6001` / `0x6002` は送信成功。
+- `0x6004` 後も復調 bank2 は `0x6080`（CS8）のままで、141 へ選局されない。
+- さらに **XCode6 の TLV/MMT グラフが解体**され、graph は devices count=5、
+  type 0x24/0x25 と buffer の handle が 0 になった。
+- `tlvcap2` の `connect_output` は `os error 1022`。
+- ソフトウェア reboot で既知状態に戻した（現在 mirakc pid 786、API 200）。
+
+したがって `mode=0` と `0x6002` の組み合わせは、TUM を初期化するのではなく
+4K グラフを破棄する方向に働いた。再試験する前に、E0 の read-only ゲート判定
+（`bAdsbInitialized`, adsb `.bss 0x395f60` の 55 バイト、`0x395dd4+dev*0x168+4`）
+と `0x6001` の mode 値、`0x6002` の送信元/応答条件を確定する必要がある。
