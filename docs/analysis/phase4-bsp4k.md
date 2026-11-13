@@ -152,3 +152,22 @@ key 0x00C, type 0 → 2 秒待ち → /api/status の SI を確認
    adsb/abs 側で切り分ける。
 4. `t4s-remote` のキー msgId を 0x12044 / 0x1115C に修正すれば Web UI からも選局できる
    （本 Phase では他エージェント管轄のため未変更）。
+
+---
+
+## 7. 追記（22:11–22:50）: mirakc API と復旧
+
+- `mirakc` の `/api/channels/BS4K/45170/stream?decode=1` は **HTTP 200** で
+  4K TS を配信（46,137,344 bytes / 12.8 s / 28.8 Mbps ほか）。
+  ffprobe は HEVC Main10 4K HLG + AAC-LATM 48 kHz 2ch。
+  `decode=0` も成功（16,830,136 bytes）。詳細は
+  `docs/analysis/phase4-mirakc-api.md`。
+- 製品 UI を 4K へ戻す際、UI マクロ `4K→1→0→1→ENTER` は
+  「選局・再生に失敗しました」となったが、
+  **`t4s-probe send 141 0 0`（0x6004 直接）で 141 の 4K 視聴状態に復帰できた**
+  （`si=Some((141,45170))`, `discover=Ok((1,2,8))`, MIXER/Sink true）。
+- 再起動後の DirectFB はサーフェス配置が変わる。`0x3C884000` は透明オーバーレイで、
+  実際の UI は `0x3A390000`（番組表）だった。OSD を見る場合は再探索が必要。
+- 22:50 頃、`decode=0` 再試行直後に実機が **ping 不通 / no route to host** となり、
+  遠隔からの復旧不能になった（電源再投入が必要）。
+  `/api/channels/BS4K/45328/stream` は未検証のまま。
