@@ -175,3 +175,100 @@ key 0x00C, type 0 → 2 秒待ち → /api/status の SI を確認
   失敗状態（MIXER/Sink=false）になり復帰不能となったため、**ユーザー指示で検証を中止**。
   45328 以降の API 検証は「未検証・電源断で中止」。詳細は
   `docs/analysis/phase4-mirakc-api.md` §6。
+
+---
+
+## 8. 追記（2026-11-14 04:52–05:04 JST）: HDMI なしヘッドレスで 4K 到達性の検証
+
+HDMI を物理的に抜いた状態で、キー注入と直接選局により 4K の
+MIXER/Sink/ES ring が live になるかを 1 操作ずつ検証した。
+mirakc は稼働中（pid 884、`/api/tuners isFree=true`）。
+
+### 8.0 初期状態
+
+```
+threads: {MIXER:false, Sink:false, buf_buf:false, HevcFactory:true}
+si:      {ok:false, reason:"no usable /tmp/adsb MH-SDT + MPT"}
+regs:    {lock:72, bank2_selection:[64,208,0]}
+q_uim:   {qnum:0, lspid:279, lrpid:470}
+```
+
+`/tmp/adsb/AdsbSiMpt.dat` は非ゼロ（8193 B）だが
+`AdsbSiMhSdtt.dat` は全ゼロ → `si.ok=false` の理由。
+
+### 8.1 手順1（直接選局 `send 141 0 0`、1 回だけ）
+
+`t4s-probe send 141 0 0` を 1 回送信。8 秒後の状態:
+
+```
+threads: {MIXER:false, Sink:false, buf_buf:false, HevcFactory:true}
+si:      {ok:false, ...}
+```
+
+一方 `t4s-probe discover` は送信直後〜数秒間だけ **Ok を返した**:
+
+```
+discover=Ok(LiveEs { mmt_demux: 8, pipeline: 685140224,
+                     video_es: 503358208, audio_es: 686166272,
+                     video_readers: 0, audio_readers: 0 })
+```
+
+- MMT_DEMUX (type 0x25, handle 8) と ES リング
+  （VIDEO 20 MiB `0x1e00a300` / AUDIO 2 MiB `0x28e61100`）は**生成された**。
+- しかし **video_readers=0 / audio_readers=0**。製品のデコーダ
+  （MIXER/Sink）が接続していない = 4K 視聴状態ではない。
+- しばらく後に再確認すると `discover=Err("no live 4K ES pair ...")` に戻った。
+
+### 8.2 手順2（4K 取得）
+
+手順1で MIXER/Sink=true にならなかったため、`t4s-tuner --type BS4K` は
+実行していない（ES リングにリーダーが付かないため意味がない）。
+
+### 8.3 手順3（キー注入、1 回ずつ・各後に status 確認）
+
+| 手順 | キー | 送信 | 8 秒後の MIXER/Sink | discover |
+|---|---|---|---|---|
+| 3a | `0x13B` (RC_4K) | type0→type2 | false / false | `Err` |
+| 3b | `0x00C` (CH UP) | type0→type2 | false / false | `Err` |
+| 3c | `0x001 0x00A 0x001`→`0x015` (1,0,1,ENTER) | 各 type0→type2 | false / false | `Err` |
+
+- 3c の後 `q_uim.lrpid` が **470 → 279 に変化**（`abs` がメッセージを消費）。
+  つまりキーはキューから受理されている。しかし `si` は変わらず
+  （`ok=false` のまま）、MIXER/Sink も復帰しない。
+- `bank2_selection` は `[64,208,0]`（lock=72）のまま。選局は起きていない。
+
+### 8.4 OSD（失敗ダイアログの有無）
+
+`0x3A390000`（この起動での UI 面）を採取:
+
+- 全画素が **カラーバー状のノイズパターン**（static/no-signal 相当）。
+  文字・ボタン・ダイアログは読み取れない。
+- 3a〜3c 後も OSD は **バイト単位で同一**
+  （240x135 縮小 md5 が前後で一致）。→ キーで UI は変化していない。
+- 採取した PPM（1920x1080 step=1 / step=2）はホストの `.tmp/` に保管
+  （リポジトリには画像を追跡しない）。
+- `0x3C884000`（旧 OSD 面）と `0x3F814000`（背景面）は今回すべて 0 画素
+  （この起動では scanout でない）。UI 面アドレスは起動ごとに変わる。
+
+### 8.5 abs スレッド
+
+`abs`(pid 279) に **`T_HDMI` / `T_HDMID` / `T_HDMID2` / `TID_VDEC` /
+`TID_AUD*` は存在する**が、**`MIXER` / `Sink` / `buf_buf` は存在しない**。
+これは docs/4K-NO-HDMI.md の「HDMI シンク無しではデコードパイプラインを
+開始しない」と一致する。
+
+### 8.6 判定
+
+**HDMI なしヘッドレスでは 4K 視聴状態（MIXER/Sink=true）に到達できなかった。**
+
+- `send 141 0 0` は MMT_DEMUX と ES リングを作るが、製品デコーダは attach せず
+  `video_readers=0` のまま。リングはリーダーが付かないので再利用できない。
+- UI キー（RC_4K / CH UP / 1,0,1,ENTER）はキューには受理される
+  （`lrpid` 変化）が、`si` も MIXER/Sink も OSD も変化しない。
+  失敗ダイアログも出ない（そもそも UI がノーシグナル画面のまま）。
+- 4K TS 取得は未達。取得できるのは製品が実際に 4K をデコードしている
+  間だけで（§0/§2 の実測）、その起動には HDMI シンク（TV または
+  EDID エミュレータ）が必要（docs/4K-NO-HDMI.md の選択肢 1/2）。
+
+追加のキー送信・`send 141 0 0` の再送・電源操作は行っていない。
+検証後の実機は `devices count=11` / `mmr61f0=0x10` / mirakc 稼働を維持している。
