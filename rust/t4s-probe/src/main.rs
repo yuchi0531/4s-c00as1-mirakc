@@ -187,12 +187,39 @@ fn main() {
             ring = drv.create_tlv_capture_ring(0x400000).map_err(|e| format!("ring: {e}"))?;
             conn = drv.connect_output(dev, ring).map_err(|e| format!("connect: {e}"))?;
             drv.set_buffer_ready(ring).map_err(|e| format!("ready: {e}"))?;
-            // Try the FDC TSin connect message directly (payload from 0x79838).
-            for (q, src) in [(0x371u32,2u32),(0x371,3),(0x36F,2),(0x36F,3)] {
-                let words = [0x10100010u32, 0, 0x18, q, 1, src, 0, 5];
-                match tuner::send_raw_message(q, 0x10100010, 0x20, &words) {
-                    Ok(()) => println!("fdc sent q={q:#x} src={src}"),
-                    Err(e) => println!("fdc ERR q={q:#x} src={src}: {e}"),
+            // FDC wire format (0x79838): the 0x20-byte message posted to the
+            // ARC FDC queue (0x10101001, adsb qid 0x371 -> msqid via
+            // bdh_out_msgh.lst 881-884763) is:
+            //   [0]=0x10010010 [1]=0x0018_0000? [2]=reply qid [3]=handle
+            //   [4]=source [5]=tsdNo [6]=op [7]=0
+            // local_b8..local_84 map to a 32-byte struct; try both word orders.
+            // Exact FDC wire layout from adsb:0x79838 stores:
+            //  sp+0x20 = 0x10010010 (u32 msg id)
+            //  sp+0x24 = 0 (u16)
+            //  sp+0x26 = 0x18 (u16)
+            //  sp+0x28 = 0x10010010 (u32, again)
+            //  sp+0x2c = param_1 handle
+            //  sp+0x30 = param_2 source
+            //  sp+0x34 = param_3 tsdNo
+            //  sp+0x38 = param_4 op
+            //  sp+0x3c = 0
+            // Words (LE): [0]=0x10010010 [1]=0x0018_0000 [2]=0x10010010
+            //             [3]=handle [4]=source [5]=tsdNo [6]=op [7]=0
+            // qid 0x371 (msqid 16679421) exists with lspid=lrpid=0 — created
+            // but never used from the host side. fdc_sys* is an adsb-internal
+            // ARC abstraction over this queue. Try both wire orders; the ARC
+            // side must be listening.
+            let handle = 1u32;
+            for src in [2u32, 3] {
+                for words in [
+                    [0x1001_0010u32, 0x0018_0000, 0x1001_0010, handle, src, 0, 5, 0],
+                    [0x1001_0010u32, 0x0000_0018, 0x1001_0010, handle, src, 0, 5, 0],
+                ] {
+                    match tuner::send_raw_message(0x371, 0x10010010, 0x20, &words) {
+                        Ok(()) => println!("fdc qid371 sent src={src} words={words:08x?}"),
+                        Err(e) => println!("fdc ERR src={src}: {e}"),
+                    }
+                    std::thread::sleep(Duration::from_millis(200));
                 }
             }
             std::thread::sleep(Duration::from_millis(500));
@@ -250,12 +277,39 @@ fn main() {
             ring = drv.create_tlv_capture_ring(0x400000).map_err(|e| format!("ring: {e}"))?;
             conn = drv.connect_output(tlv, ring).map_err(|e| format!("connect: {e}"))?;
             drv.set_buffer_ready(ring).map_err(|e| format!("ready: {e}"))?;
-            // Try the FDC TSin connect message directly (payload from 0x79838).
-            for (q, src) in [(0x371u32,2u32),(0x371,3),(0x36F,2),(0x36F,3)] {
-                let words = [0x10100010u32, 0, 0x18, q, 1, src, 0, 5];
-                match tuner::send_raw_message(q, 0x10100010, 0x20, &words) {
-                    Ok(()) => println!("fdc sent q={q:#x} src={src}"),
-                    Err(e) => println!("fdc ERR q={q:#x} src={src}: {e}"),
+            // FDC wire format (0x79838): the 0x20-byte message posted to the
+            // ARC FDC queue (0x10101001, adsb qid 0x371 -> msqid via
+            // bdh_out_msgh.lst 881-884763) is:
+            //   [0]=0x10010010 [1]=0x0018_0000? [2]=reply qid [3]=handle
+            //   [4]=source [5]=tsdNo [6]=op [7]=0
+            // local_b8..local_84 map to a 32-byte struct; try both word orders.
+            // Exact FDC wire layout from adsb:0x79838 stores:
+            //  sp+0x20 = 0x10010010 (u32 msg id)
+            //  sp+0x24 = 0 (u16)
+            //  sp+0x26 = 0x18 (u16)
+            //  sp+0x28 = 0x10010010 (u32, again)
+            //  sp+0x2c = param_1 handle
+            //  sp+0x30 = param_2 source
+            //  sp+0x34 = param_3 tsdNo
+            //  sp+0x38 = param_4 op
+            //  sp+0x3c = 0
+            // Words (LE): [0]=0x10010010 [1]=0x0018_0000 [2]=0x10010010
+            //             [3]=handle [4]=source [5]=tsdNo [6]=op [7]=0
+            // qid 0x371 (msqid 16679421) exists with lspid=lrpid=0 — created
+            // but never used from the host side. fdc_sys* is an adsb-internal
+            // ARC abstraction over this queue. Try both wire orders; the ARC
+            // side must be listening.
+            let handle = 1u32;
+            for src in [2u32, 3] {
+                for words in [
+                    [0x1001_0010u32, 0x0018_0000, 0x1001_0010, handle, src, 0, 5, 0],
+                    [0x1001_0010u32, 0x0000_0018, 0x1001_0010, handle, src, 0, 5, 0],
+                ] {
+                    match tuner::send_raw_message(0x371, 0x10010010, 0x20, &words) {
+                        Ok(()) => println!("fdc qid371 sent src={src} words={words:08x?}"),
+                        Err(e) => println!("fdc ERR src={src}: {e}"),
+                    }
+                    std::thread::sleep(Duration::from_millis(200));
                 }
             }
             std::thread::sleep(Duration::from_millis(500));
