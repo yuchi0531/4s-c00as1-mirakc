@@ -244,3 +244,171 @@ mirakc 再起動後の CS 検証で以下を観測した。
 **現状**: `/api/channels` は 24 件、`/api/services` は `[]`、mirakc は稼働中。
 製品 UI は 45328/101 の失敗状態で、電源再投入またはユーザー操作による復旧が必要。
 
+---
+
+## 9. API 実配信の再検証（2026-11-14 00:52–01:05 JST）
+
+電源再投入後、mirac pid 978 / t4s-remote pid 982、`MIXER/Sink/buf_buf=true`,
+SI 141/45170 の状態から開始した。
+
+### 9.1 BS4K/45170（decode=1、11 秒）
+
+```text
+GET /api/channels/BS4K/45170/stream?decode=1
+HTTP 200 / 30,295,530 bytes / 10.999 s / 25.05 Mbps
+first4 = 47 40 00 10
+```
+
+ffprobe:
+
+- video: **hevc / Main 10 / 3840x2160** / yuv420p10le /
+  bt2020nc / bt2020 / arib-std-b67 / 59.94 fps
+- audio: **aac_latm / LC / 48000 Hz / stereo**
+- duration 9.676 s
+
+4K は成功。製品が 141/45170 を視聴中のため、同一チャンネル共有で取得できた。
+
+### 9.2 BS/BS13_0（decode=1、最大 8 秒）
+
+- 1 回目: **HTTP 404** `application/json`、`{"code":404,"reason":null,"errors":[]}`、
+  TS bytes **0**、2.54 秒で応答。
+- 2/3 回目: ホスト→実機の TCP timeout で HTTP 000。
+- mirakc log:
+
+```text
+Streaming started channel=BS/BS13_0 ... stream.id=0.1.1
+Streaming stopped stream.id=0.1.1
+```
+
+`do_streaming` は最初の TS パケットが来るまで `server.stream-time-limit`
+（約 3 秒）待ち、来ない場合は 404 を返す。今回は 3 秒以内に TS が来ず、
+ffprobe 用のデータを取得できなかった。FED 直接経路でも、製品が 4K を
+視聴中での 2K への切り替えはこの時点では成立しなかった。
+
+### 9.3 CS/CS8（decode=0、8 秒）
+
+- mirakc API: **HTTP 000 / 0 bytes**。ログには
+  `Streaming started channel=CS/CS8` / `Streaming stopped` が記録された
+  （15:55:30–39、15:57:18–23）。
+- 切り分けのため t4s-tuner 単体を実行:
+
+```text
+/mnt/t4s/opt/t4s/bin/t4s-tuner --type CS --channel CS8 --duration 6 - > /tmp/cs8.ts
+```
+
+結果:
+
+- `/tmp/cs8.ts` は **0 bytes**（`od` でも先頭バイトなし）
+- ログ: `mkra: opened ISDB-S RF 12411000 TSID 6080 / raw`
+- full-TS ring create と connect_output は成功したが、`host_read` が
+  6 秒間データを返さず、`frontend restore warning` で終了
+
+したがって CS は mirakc の tuner 起動/TSI 経路ではなく、**CS 選局自体が
+TS を出力できていない**（アンテナ/受信環境または CS 選局処理の問題）。
+
+### 9.4 製品の復帰
+
+- ストリーム検証後: `t4s-probe send 141 0 0` を 1 回実行。
+  `si=Some((141, 45170))` になったが、`MIXER/Sink/buf_buf=false` のまま。
+- scan-services 試行後の復旧時: `send 141 0 0` をもう 1 回実行。
+  同じく `si=Some((141, 45170))`、`discover=Err`/`None`、
+  `MIXER/Sink/buf_buf=false` のまま。
+
+HDMI は失われてよいとの指示のため、API の可用性を優先した。
+キー送信は行っていない。
+
+### 9.5 scan-services
+
+`jobs.scan-services.disabled` を `false` にして mirakc を再起動したが、
+起動時に以下の設定検証エラーで mirakc が停止した。
+
+```text
+ERROR mirakc_core::config: config.jobs.scan-services.command: must be a valid command
+```
+
+`mirakc-arib` / `mirakc-arib-tlv` は実機に存在しない
+（`/usr/local/bin`、`/usr/bin`、`/opt/t4s/bin` を確認）。
+このため `scan-services` は実行できず、設定を `disabled: true` に戻して
+mirakc を再起動した（復旧後の pid 1249）。
+
+`/api/services` は **`[]`** のまま。services を埋めるには
+`mirakc-arib`（BS/CS）と必要なら `mirakc-arib-tlv`（BS4K）を実機へ
+インストールしたうえで `scan-services` を有効化する必要がある。
+
+### 9.6 最終状態
+
+- `/api/version` → **200**
+- `/api/channels` → **200 / 24 件**（BS 6 / CS 12 / BS4K 6）
+- `/api/services` → **200 / `[]`**
+- 製品 `/api/status` → **MIXER/Sink/buf_buf=false**、SI **141/45170**
+- mirakc は pid 1249 で稼働中。
+
+---
+
+## 10. mirakc 停止下での 2K 直接取得（2026-11-14 01:05–01:08 JST）
+
+ユーザー指示により API 検証と scan-services を中止し、mirakc を停止した。
+
+```text
+kill $(cat /mnt/t4s/run/mirakc.pid)   # pid 1249
+127.0.0.1:40772/api/version           # wget: Connection refused
+host -> 192.168.1.154:40772           # curl: Connection refused
+```
+
+mirakc は再起動していない。t4s-remote (8484, pid 982) は状態読み取り用に残した。
+
+### 10.1 BS/BS13_0（直接取得）
+
+```sh
+/mnt/t4s/opt/t4s/bin/t4s-tuner --type BS --channel BS13_0 --duration 8 - \
+  > /tmp/bs2k.ts 2> /tmp/bs2k.log
+```
+
+- rc 0、**16,131,528 bytes**
+- 先頭 16 bytes: `47 21 49 de 69 60 64 5b a0 ab 76 fc e1 5a a7 b4`
+- ログ:
+  - `mkra: opened ISDB-S RF 11957640 TSID 40D0 / raw`
+  - `t4s-tuner: BS BS13_0 -> RF 11957640 kHz TSID 40D0`
+  - デフォルトの physical TSI0 → logical TSI1 remap を使用
+- ホストへの転送: `/media/usb` はホストに存在しないため
+  `t4s-probe putfile 192.168.100.100:9100 /tmp/bs2k.ts` を使用
+  （16,131,528 bytes を 9100/tcp で受信）
+- ffprobe:
+  - container: `mpegts`
+  - video: **mpeg2video**
+  - audio: **aac**
+  - ただし raw TS は 91.57%（85,806 パケット中 78,573）が
+    transport_scrambling_control != 0 のため、ffprobe の
+    width/height は 0、audio sample_rate も 0。
+  - 生 TS の取得自体は成功。クリア映像の確認には復号が必要。
+- 参考: 取得済みファイルを後から `t4s-cas` に通すと
+  `BS2K startup exceeded 4 MiB` で失敗した。`t4s-cas` はライブ
+  パイプライン（mirakc `decode=1` 相当）で使う必要がある。
+
+### 10.2 CS/CS8（直接取得）
+
+```sh
+T4S_CS_TSI_PORT=0 /mnt/t4s/opt/t4s/bin/t4s-tuner \
+  --type CS --channel CS8 --duration 8 - > /tmp/cs2k.ts 2> /tmp/cs2k.log
+```
+
+- 1 回目・再試行とも rc 0、**0 bytes**（先頭バイトなし）
+- ログ:
+  - `mkra: opened ISDB-S RF 12411000 TSID 6080 / raw`
+  - `t4s-tuner: CS CS8 -> RF 12411000 kHz TSID 6080`
+  - `host_read` が 8 秒間データを返さず
+  - `frontend restore warning: unrecognised tuner ELF`
+- ffprobe: 入力 TS が 0 bytes のため実施不可。
+
+`docs/CS-STATUS.md` の過去成功（`T4S_CS_TSI_PORT=0`、CS8 で
+35,651,584 bytes）とは状態が異なる。今回の試行時の製品は
+`MIXER/Sink/buf_buf=false` の失敗状態で、CS の物理 TSI/DEMUX が
+TS を出力できていない。mirakc 経路ではなく、選局/受信側の問題として記録する。
+
+### 10.3 最終状態
+
+- mirakc: **停止**（40772 は connection refused、再起動なし）
+- t4s-remote: 8484 で稼働（pid 982）
+- BS 2K: 生 TS 16,131,528 bytes 取得成功（scrambled、ffprobe は codec のみ）
+- CS 2K: 2 回試行とも 0 bytes、ffprobe 不可
+
