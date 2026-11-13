@@ -412,3 +412,61 @@ TS を出力できていない。mirakc 経路ではなく、選局/受信側の
 - BS 2K: 生 TS 16,131,528 bytes 取得成功（scrambled、ffprobe は codec のみ）
 - CS 2K: 2 回試行とも 0 bytes、ffprobe 不可
 
+---
+
+## 11. CS キーによる復帰試行（2026-11-14 01:10 JST）
+
+mirakc は停止したまま（40772 は connection refused、再起動なし）。
+
+### 11.1 キー送信前
+
+`GET /api/status`:
+
+```json
+{
+  "threads": {"MIXER": false, "Sink": false, "buf_buf": false, "HevcFactory": true},
+  "si": {"tlv_stream_id": 45170, "service_id": 141},
+  "regs": {"lock": 103, "bank2_selection": [96, 128, 0]}
+}
+```
+
+### 11.2 CS キー 0x0B6
+
+`POST /api/key` で **1 回だけ**送信:
+
+```json
+{"code": 182, "release": true}
+```
+
+応答:
+
+```json
+{"ok":true,"code":182,"name":"RC_CS","type":0,"release":true,"primer":0}
+```
+
+`release: true` により、`type 0` → 200 ms → `type 2` が 1 回だけ実行された。
+
+### 11.3 10 秒後
+
+`GET /api/status`:
+
+```json
+{
+  "threads": {"MIXER": false, "Sink": false, "buf_buf": false, "HevcFactory": true},
+  "si": {"tlv_stream_id": 45170, "service_id": 141},
+  "regs": {"lock": 103, "bank2_selection": [96, 128, 0]},
+  "last_key": {"code": 182, "name": "RC_CS", "age_s": 15}
+}
+```
+
+CS キーは受理された（`last_key` に 182 が記録）が、MIXER/Sink は false のまま、
+SI も 141/45170 から変化しなかった。製品は CS モードへ遷移していない。
+
+### 11.4 中止
+
+ユーザー指示の「MIXER/Sink が false のままなら、それ以上キーを送らず、
+send 141 0 0 もせず、直ちに中止」に従い、追加のキー送信・CS 直接取得・
+`send 141 0 0` は行っていない。
+
+**要・電源再投入**。mirakc は停止状態を維持している。
+
