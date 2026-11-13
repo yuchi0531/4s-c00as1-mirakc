@@ -272,3 +272,93 @@ discover=Ok(LiveEs { mmt_demux: 8, pipeline: 685140224,
 
 追加のキー送信・`send 141 0 0` の再送・電源操作は行っていない。
 検証後の実機は `devices count=11` / `mmr61f0=0x10` / mirakc 稼働を維持している。
+
+---
+
+## 9. 追記（2026-11-14 08:0x JST）: HDMI 未接続で 4K live + 取得成功（重要な新事実）
+
+本セッション開始時、実機は **前タスク中に自然再起動**しており（dmesg は fresh boot、
+私の mount 時のみ `FAT-fs: Volume was not properly unmounted`）、前提と異なる状態だった:
+
+- mirakc / t4s-remote は **停止**（pidfile 884 は stale、port 40772/8484 未 listen）。
+- 製品は **4K(141/45170) を実デコード中**:
+  `si=Some(141/45170)`, `discover=Ok(LiveEs{mmt_demux:8, video_readers:1, audio_readers:2})`,
+  `MIXER`/`Sink`/`buf_buf`/`HevcFactory` スレッドあり、video ES ring の wpos が進行。
+
+つまり **HDMI 未接続のまま 4K 視聴状態に到達していた**。
+
+### 9.1 制約遵守
+
+`tlvcap`/`tlvcap2`/`tlvcap3` は FED 再選局で live 4K を破壊し、`tlvcap2` は
+さらに 0x6004 を送る（禁止）ため **実行していない**。キー送信・0x6004・選局・
+reboot・電源操作・mirakc 起動もしない。行ったのは read-only 観測と、製品の
+選択を変えない `t4s-tuner --type BS4K` 取得のみ。
+
+`t4s-tuner --type BS4K --channel 45170` は `tune_4k` の先頭で
+「live SI が要求 service と一致し discover が Ok」なら `send_change`（0x6004）を
+**送らずに** REMUX tap へ進む（`rust/t4s-tuner/src/main.rs:204`）。今回は live が
+141/45170 だったため 0x6004 は送信されていない（ログに `confirmed`/`send_change` 無し）。
+
+### 9.2 取得結果
+
+| 回 | bytes | 先頭16 | format | duration | bit_rate | read |
+|---:|---:|---|---|---:|---:|---|
+| 1 | 38,329,628 | `47 40 00 10 00 00 b0 0d b0 72 c1 00 00 00 8d e1` | mpegts | 10.71 s | 28.63 Mbps | rc=0 |
+| 2 | 23,471,424 | `47 40 00 10 00 00 b0 0d b0 72 c1 00 00 00 8d e1` | mpegts | 6.51 s | 28.84 Mbps | rc=0 |
+
+- 188 バイト TS、sync ratio **1.0000**。PAT TSID **45170**、program 141、PMT PID 256。
+- ストリーム: video PID `0x1011` (type 0x24=HEVC), audio PID `0x1100` (type 0x11=AAC)。
+- ffprobe:
+  - video: **hevc / Main 10 / 3840x2160 / yuv420p10le / color_transfer=arib-std-b67 (HLG) /
+    color_primaries=bt2020**
+  - audio: **aac_latm / 48000 Hz / 2ch**
+- ログ: `BS4K 45170 -> service 141, TLV 0xb072`、
+  `remux4k: MMT_DEMUX=0x8 ... video_es=0x1e00bd00 (readers 1) audio_es=0x28e63300 (readers 2)`。
+  read 中に 160-297 ms の gap を数十回 "recovered"（tap が live ES ring を共有するため）。
+  `0 resyncs`。
+
+### 9.3 取得前後の live 状態（壊していないことの確認）
+
+| | 取得前 | 1回目後 | 2回目後 |
+|---|---|---|---|
+| discover | `Ok(readers 1/2)` | `Ok(readers 1/2)` | `Ok(readers 1/2)` |
+| si | 141/45170 | 141/45170 | 141/45170 |
+| graph devices | 22 | 22 | 22 |
+| mmr61f0 | 0x10 | 0x10 | 0x10 |
+
+同一 video_es/audio_es handle のまま。取得は製品の選択・デコードを止めていない。
+
+### 9.4 HDMI シンクの有無（read-only 判定）
+
+kernel 3.10 で **`/sys/class/drm` は存在しない**（CONFIG_DRM 無し）。
+`dmesg` にケーブル接続/HPD の明示イベントは無い。read-only で観測できた材料:
+
+- `/sys/class/drm/*/status` … **不可**（drm class 無し）。
+- `dmesg | grep -iE 'hdmi|hotplug|edid|hpd|cec'` … `xc_aud_dev_register hdmi_delay...` と
+  `HDMI UFLOW` ×4 のみ。HPD イベント行は無い。
+- abs スレッド: **`T_HDMI` / `T_HDMID` / `T_HDMID2` / `T_OUTD` / `T_OUTD_DRV` / `T_AVM`
+  が存在**（HDMI 制御スレッドは起動している）。
+- `/proc/interrupts`: **`xcfb interrupt` (IRQ33) が ~120/s** 進行、**`HDMI Audio` (IRQ45)**
+  も進行。ディスプレイ/Audio の scanout が動いている。
+- 拡張 GPIO: `gpio2=0(in) gpio5=1(in) gpio6=1(out) gpio9=1(out)`。
+- i2c-1 (XCODE6-0 I2C-1) の **DDC/EDID アドレス 0x50 が応答**: `i2cdetect` で 0x50 検出。
+  ただし `i2cget`/`i2cdump` の内容は **不安定**で、標準 EDID ヘッダ
+  `00 ff ff ff ff ff ff 00` は **40 回読んでも得られなかった**。読めるのは 128 バイトの
+  内部レジスタ様パターン（0x80-0xF0 が 0x00-0x70 を反復）で、外部 EEPROM の
+  EDID とは読めない。
+
+**判定**: 「HDMI 未接続」と報告されているが、read-only では **外部 HDMI シンクの
+存在を確定できない**（drm 無し・dmesg に HPD 無し・EDID ヘッダが読めない）。
+一方で HDMI 制御系スレッドと xcfb/HDMI Audio 割り込みは動作しており、製品は
+4K を実デコードしている。**EDID エミュレータ/ダミープラグ、または HDMI ケーブルが
+実際には接続されている**可能性が高く、`docs/4K-NO-HDMI.md` の「HDMI シンクが
+無ければデコードを開始しない」は、少なくとも今回の起動状態とは整合しない。
+真偽は物理接続の確認（現地目視）が必要。
+
+### 9.5 結論
+
+- HDMI 未接続とされる状態で、**4K(141/45170) が live のまま、`t4s-tuner --type BS4K`
+  で HEVC Main10 4K HLG + AAC-LATM の TS を 2 回連続取得できた**（0x6004 不使用、
+  live 状態は無破壊）。
+- ただし HDMI シンクの有無自体は read-only では確定できず、物理接続の確認が必要。
+  「HDMI なしでも 4K が取れる」と断定はせず、この観測事実のみ記録する。

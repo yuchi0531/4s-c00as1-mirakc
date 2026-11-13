@@ -6,6 +6,15 @@
 ES リング**（video 20 MiB / audio 2 MiB）と、XCode6 の **REMUX** が必要です。
 この 2 つは本体が実際に 4K サービスをデコードしている間だけ存在します。
 
+> **2026-11-14 追記（要確認）**: HDMI 未接続と報告された状態で、製品が
+> 4K(141/45170) を **live デコード中**（`discover=Ok{video_readers:1,audio_readers:2}`,
+> MIXER/Sink/buf_buf スレッドあり, ES ring 進行）となり、`t4s-tuner --type BS4K` で
+> HEVC Main10 4K HLG + AAC-LATM の TS を 2 回連続取得できた実測がある。
+> read-only では HDMI シンクの有無を確定できず（`/sys/class/drm` 無し・dmesg に
+> HPD 無し・i2c-1 0x50 から EDID ヘッダが読めない）、**EDID エミュレータ/ダミー
+> プラグか HDMI ケーブルが実際に接続されている可能性**が高い。物理接続の目視確認が
+> 必要。詳細は [phase4-bsp4k.md §9](analysis/phase4-bsp4k.md)。
+
 本体は HDMI 出力先（TV / EDID を持つダミープラグ）を検出しないと
 デコードパイプライン（`MIXER` / `Sink` スレッド）を開始しません。
 LED が緑（または青）でも、HDMI 無しでは `discover()` が
