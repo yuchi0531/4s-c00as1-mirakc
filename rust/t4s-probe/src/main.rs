@@ -145,6 +145,81 @@ fn main() {
         println!("run tlvcap2 next");
         return;
     }
+    if arg == "tlvcap3" {
+        // Power LNB via 2K FED, then tune ADBS directly.
+        let fem = tuner::Tuner::open(tuner::MSGH_LIST).expect("fem");
+        fem.set_device(&tuner::FemDeviceRequest::assign(1, 2)).expect("assign 2K");
+        std::thread::sleep(Duration::from_millis(300));
+        let bs = tuner::FedTuneRequest::isdb_s(1, 16625, 11_996_000).expect("bs");
+        tuner::Tuner::open_qid(bs.fed_qid, tuner::MSGH_LIST).expect("fed2k").tune_fed(&bs).expect("tune2k");
+        std::thread::sleep(Duration::from_secs(1));
+        match t4s_core::gr_i2c::quiesce_ts_output() {
+            Ok(v) => println!("quiesce {:#x}->{:#x}", v.before, v.after),
+            Err(e) => println!("quiesce ERR {e}"),
+        }
+        std::thread::sleep(Duration::from_millis(200));
+        for _ in 0..3 {
+            let _ = fem.set_device(&tuner::FemDeviceRequest::disconnect(1));
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        fem.set_device(&tuner::FemDeviceRequest::assign(1, 0x200)).expect("assign adbs");
+        std::thread::sleep(Duration::from_millis(300));
+        let adbs = tuner::FedTuneRequest::advanced_bs(0xB072, 11_842_560);
+        tuner::Tuner::open_qid(adbs.fed_qid, tuner::MSGH_LIST).expect("fed4k").tune_fed(&adbs).expect("tune4k");
+        std::thread::sleep(Duration::from_secs(2));
+        let regs = t4s_core::gr_i2c::read_output_regs().ok();
+        if let Some(r) = &regs {
+            let cc = r.bank0.iter().find(|(x,_)| *x==0xcc).map(|(_,v)|*v).unwrap_or(0);
+            println!("before lock={:#x} bank2={:?} cc={cc:#x}", r.lock, r.bank2_selection);
+            if cc & 0xc0 == 0xc0 {
+                match t4s_core::gr_i2c::select_tlv_output_exclusive() {
+                    Ok(v) => println!("tlv exclusive {:#x}->{:#x}", v.before, v.after),
+                    Err(e) => println!("tlv exclusive ERR {e}"),
+                }
+            }
+        }
+        let mut dev = 0u32; let mut ring = 0u32; let mut conn = 0u32; let mut src = None;
+        let mut result = String::new();
+        let run = (|| -> Result<(), String> {
+            dev = drv.create_tlv_demux_ex(8).map_err(|e| format!("create: {e}"))?;
+            drv.config_tlv_mode(dev, 1).map_err(|e| format!("cfg: {e}"))?;
+            let _ = drv.set_tlv_clock_owner(dev);
+            ring = drv.create_tlv_capture_ring(0x400000).map_err(|e| format!("ring: {e}"))?;
+            conn = drv.connect_output(dev, ring).map_err(|e| format!("connect: {e}"))?;
+            drv.set_buffer_ready(ring).map_err(|e| format!("ready: {e}"))?;
+            // Try the FDC TSin connect message directly (payload from 0x79838).
+            for (q, src) in [(0x371u32,2u32),(0x371,3),(0x36F,2),(0x36F,3)] {
+                let words = [0x10100010u32, 0, 0x18, q, 1, src, 0, 5];
+                match tuner::send_raw_message(q, 0x10100010, 0x20, &words) {
+                    Ok(()) => println!("fdc sent q={q:#x} src={src}"),
+                    Err(e) => println!("fdc ERR q={q:#x} src={src}: {e}"),
+                }
+            }
+            std::thread::sleep(Duration::from_millis(500));
+            let reader = drv.create_reader(ring).map_err(|e| format!("reader: {e}"))?;
+            let mut s = t4s_core::tssrc::XcReaderSource::adopt(Arc::clone(&drv), ring, reader, 500);
+            let begin = Instant::now();
+            let mut total = 0usize; let mut first = Vec::new();
+            while begin.elapsed() < Duration::from_secs(3) {
+                let mut buf = Vec::new();
+                match s.read_into(&mut buf) {
+                    Ok(_) => { total += buf.len(); if first.len() < 64 { first.extend_from_slice(&buf); } }
+                    Err(e) => { result = format!("read ERR {e}"); break; }
+                }
+            }
+            let (n, _) = t4s_core::graph::tlv_score(&first);
+            result = format!("dev={dev:#x} total={total} first={:02x?} tlv_chain={n}", first);
+            src = Some(s);
+            Ok(())
+        })();
+        if let Err(e) = run { result = format!("ERR {e}"); }
+        drop(src);
+        if conn != 0 { let _ = drv.disconnect(dev, conn); }
+        if ring != 0 { let _ = drv.force_reset_buffer(ring); let _ = drv.destroy_buffer(ring); }
+        if dev != 0 { let _ = drv.stop_device(dev); let _ = drv.destroy_device(dev); }
+        println!("tlvcap3 {result}");
+        return;
+    }
     if arg == "tlvcap2" {
         // 1) Clear the stale 2K TLV-output bit if present.
         let regs = t4s_core::gr_i2c::read_output_regs().expect("regs");
@@ -175,6 +250,15 @@ fn main() {
             ring = drv.create_tlv_capture_ring(0x400000).map_err(|e| format!("ring: {e}"))?;
             conn = drv.connect_output(tlv, ring).map_err(|e| format!("connect: {e}"))?;
             drv.set_buffer_ready(ring).map_err(|e| format!("ready: {e}"))?;
+            // Try the FDC TSin connect message directly (payload from 0x79838).
+            for (q, src) in [(0x371u32,2u32),(0x371,3),(0x36F,2),(0x36F,3)] {
+                let words = [0x10100010u32, 0, 0x18, q, 1, src, 0, 5];
+                match tuner::send_raw_message(q, 0x10100010, 0x20, &words) {
+                    Ok(()) => println!("fdc sent q={q:#x} src={src}"),
+                    Err(e) => println!("fdc ERR q={q:#x} src={src}: {e}"),
+                }
+            }
+            std::thread::sleep(Duration::from_millis(500));
             let reader = drv.create_reader(ring).map_err(|e| format!("reader: {e}"))?;
             let mut s = t4s_core::tssrc::XcReaderSource::adopt(Arc::clone(&drv), ring, reader, 500);
             let begin = Instant::now();
@@ -206,6 +290,15 @@ fn main() {
         let bs = tuner::FedTuneRequest::isdb_s(1, 16625, 11_996_000).expect("bs req");
         tuner::Tuner::open_qid(bs.fed_qid, tuner::MSGH_LIST).expect("fed2k").tune_fed(&bs).expect("tune2k");
         std::thread::sleep(Duration::from_secs(1));
+        match t4s_core::gr_i2c::quiesce_ts_output() {
+            Ok(v) => println!("quiesce {:#x}->{:#x}", v.before, v.after),
+            Err(e) => println!("quiesce ERR {e}"),
+        }
+        std::thread::sleep(Duration::from_millis(200));
+        for _ in 0..3 {
+            let _ = fem.set_device(&tuner::FemDeviceRequest::disconnect(1));
+            std::thread::sleep(Duration::from_millis(100));
+        }
         fem.set_device(&tuner::FemDeviceRequest::assign(1, 0x200)).expect("assign adbs");
         std::thread::sleep(Duration::from_millis(300));
         let adbs = tuner::FedTuneRequest::advanced_bs(0xB072, 11_842_560);

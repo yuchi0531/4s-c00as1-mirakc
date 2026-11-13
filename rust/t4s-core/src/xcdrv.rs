@@ -762,6 +762,32 @@ impl XcDrv {
     }
 
     /// RING / SYSTEM / TS, matching `ts_input_t::detect_stream` exactly.
+    /// SDEV_CREATE_EX 0x2D: create a type 0x24 TLV demux with explicit
+    /// input/output counts.  The product uses n_in=0 (implicit chip TLV
+    /// capture) and n_out=8; a private consumer can use n_out=1.
+    pub fn create_tlv_demux_ex(&self, n_out: u32) -> io::Result<u32> {
+        let mut req = [0x24u32, 0, n_out, 0, 0, 0];
+        unsafe { self.call(0x2d, &mut req)? };
+        if req[5] == 0 {
+            return Err(io::Error::other("TLV demux create_ex returned handle 0"));
+        }
+        Ok(req[5])
+    }
+
+    /// 0xD002A: make the TLV device the clock owner (product wrap_demuxInit).
+    pub fn set_tlv_clock_owner(&self, device: u32) -> io::Result<()> {
+        let mut req = [device, 1];
+        unsafe { self.call(0x000d_002a, &mut req)? };
+        Ok(())
+    }
+
+    /// 0xA31002A: TLV device config.  mode 0 = Recorder, 1 = TunerBox.
+    pub fn config_tlv_mode(&self, device: u32, mode: u32) -> io::Result<()> {
+        let mut req = [device, mode];
+        unsafe { self.call(0x0a31_002a, &mut req)? };
+        Ok(())
+    }
+
     /// RING/SYSTEM/MMTP(9) capture ring matching adsb's TLV topology.
     pub fn create_tlv_capture_ring(&self, units: u32) -> io::Result<u32> {
         let mut req = [3u32, 1, 9, 1, 0x1000, units, 1, 3, 0];
