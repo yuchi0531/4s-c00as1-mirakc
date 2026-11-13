@@ -97,3 +97,24 @@ CS を復号するには、CS 2K の契約済み B-CAS/ACAS カード、また�
 
 `config.full.yml`（BS6/CS12/BS4K6）で `/api/channels` 200。
 CS は `decode=0` で受信可能、`decode=1` は CAS entitlement で 404。
+
+## CS 無料/クリアサービスの映像確認（2026-11-13）
+
+CS8（ショップチャンネル）のトランスポンダを `decode=0` で 6 秒取得
+（35,651,584 バイト）。PAT/PMT を確認すると 4 サービス:
+
+| program | video | audio | 状態 |
+|---:|---|---|---|
+| 55 | 1440x1080 MPEG-2 | AAC | clear（映像デコード可） |
+| 218 | 1440x1080 MPEG-2 | AAC | clear（映像デコード可） |
+| 318 | 0x0 | AAC | scrambled |
+| 349 | 0x0 | AAC | scrambled |
+
+program 218 の video/audio PID を抜き出し、`ffmpeg` で 1 フレームを
+デコードしたところ、実映像（画面に `TOEI ch.` 表示）を確認した。
+これはカード復号を必要としないクリアサービスで、CS の受信・映像確認は
+完了している。`decode=1` は同じ TS 内の scrambled サービス（provider
+0x0800）で CAS が停止するが、ユーザー指示により無視する。
+
+mirakc の `decode=0` は全 TS を配信する。クリアサービスだけを選ぶには
+`mirakc-arib filter-service` などのサービスフィルタが必要（未導入）。
