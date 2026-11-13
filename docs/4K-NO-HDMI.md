@@ -61,3 +61,17 @@ duplicate が 0 バイトなのは、TLV demux に **選局入力/ロックが�
 再起動した。HDMI シンク無しで TLV を出すには、`adsb` の初期化を
 製品自身に完了させる（= HDMI/UI が必要）か、TLV demux の入力を
 自前で構成する Phase 2 の実装が必要。
+
+
+## Phase 1 追加試験: TSI からの TLV 直接取得
+
+CS と同様に physical TSI0 を **130 バイト (ME_PACKET_130)** に設定し、
+TS_RECODER(type 0x13) の出力を 130 バイト RING に接続する試験を行った。
+`connect_output` は **os error 1025 (XCE_INVAL_PARAM)** で拒否された。
+TS_RECODER は 188 バイト TS 専用で、TLV の 130 バイトリングは受け付けない。
+
+4K の TLV は製品の type 0x24 TLV デマルチプレクサが作る 4 本の
+4MiB リングに依存する。外部タップは type 0x24 への追加
+`connect_output`（8 output ports）だが、TLV demux に選局入力/ロックが
+無いため 0 バイト。TLV demux の入力構成（0xA31002A の再現）と
+`bAdsbInitialized` の正しい実アドレスが Phase 2 の課題。

@@ -762,6 +762,16 @@ impl XcDrv {
     }
 
     /// RING / SYSTEM / TS, matching `ts_input_t::detect_stream` exactly.
+    /// RING buffer with an explicit unit size, used for raw TLV (130 bytes).
+    pub fn create_ring(&self, unit_size: u32, units: u32, media_type: u32, max_reader: u32) -> io::Result<u32> {
+        let mut req = [3u32, media_type, 0, max_reader, 0x1000, units, unit_size, 3, 0];
+        unsafe { self.call(SBUF_CREATE, &mut req)? };
+        if req[8] == 0 {
+            return Err(io::Error::other("ring create returned handle 0"));
+        }
+        Ok(req[8])
+    }
+
     pub fn create_ts_recorder_buffer(&self) -> io::Result<u32> {
         let mut req = [3u32, 1, 2, 1, 0x1000, 0x4000, 188, 3, 0];
         unsafe { self.call(SBUF_CREATE, &mut req)? };

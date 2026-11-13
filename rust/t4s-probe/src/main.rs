@@ -53,6 +53,69 @@ fn graph_dump(drv: &Arc<XcDrv>) {
 fn main() {
     let arg = std::env::args().nth(1).unwrap_or_default();
     let drv = Arc::new(XcDrv::open_path(t4s_core::xcdrv::DEV_PATH).expect("driver"));
+    if arg == "tlvcap" {
+        // Power the LNB through the 2K frontend, then tune ADBS directly.
+        let fem = tuner::Tuner::open(tuner::MSGH_LIST).expect("fem");
+        fem.set_device(&tuner::FemDeviceRequest::assign(1, 2)).expect("assign 2K");
+        std::thread::sleep(Duration::from_millis(300));
+        let bs = tuner::FedTuneRequest::isdb_s(1, 16625, 11_996_000).expect("bs req");
+        tuner::Tuner::open_qid(bs.fed_qid, tuner::MSGH_LIST).expect("fed2k").tune_fed(&bs).expect("tune2k");
+        std::thread::sleep(Duration::from_secs(1));
+        fem.set_device(&tuner::FemDeviceRequest::assign(1, 0x200)).expect("assign adbs");
+        std::thread::sleep(Duration::from_millis(300));
+        let adbs = tuner::FedTuneRequest::advanced_bs(0xB072, 11_842_560);
+        tuner::Tuner::open_qid(adbs.fed_qid, tuner::MSGH_LIST).expect("fed4k").tune_fed(&adbs).expect("tune4k");
+        std::thread::sleep(Duration::from_secs(2));
+
+        let mapping = drv.snapshot_tsi_mapping().ok();
+        let saved = mapping.as_ref().and_then(|m| m.request(0));
+        let mut pipe = 0u32;
+        let mut dev = 0u32;
+        let mut ring = 0u32;
+        let mut conn = 0u32;
+        let mut src = None;
+        let mut result = String::new();
+        let run = (|| -> Result<(), String> {
+            drv.configure_physical_tsi_packet(0, 3).map_err(|e| format!("tsi130: {e}"))?;
+            pipe = drv.create_pipeline().map_err(|e| format!("pipe: {e}"))?;
+            dev = drv.create_ts_recorder().map_err(|e| format!("recorder: {e}"))?;
+            drv.set_pipeline(dev, pipe).map_err(|e| format!("setpipe: {e}"))?;
+            drv.config_ts_recorder_tsi(dev, 0).map_err(|e| format!("tsi: {e}"))?;
+            ring = drv.create_ring(130, 0x4000, 1, 2).map_err(|e| format!("ring: {e}"))?;
+            conn = drv.connect_output(dev, ring).map_err(|e| format!("connect: {e}"))?;
+            drv.set_buffer_ready(ring).map_err(|e| format!("ready: {e}"))?;
+            drv.run_device(dev).map_err(|e| format!("run: {e}"))?;
+            let reader = drv.create_reader(ring).map_err(|e| format!("reader: {e}"))?;
+            let mut s = t4s_core::tssrc::XcReaderSource::adopt(Arc::clone(&drv), ring, reader, 200);
+            let begin = Instant::now();
+            let mut total = 0usize;
+            let mut first = Vec::new();
+            while begin.elapsed() < Duration::from_secs(3) {
+                let mut buf = Vec::new();
+                match s.read_into(&mut buf) {
+                    Ok(n) => {
+                        total += n;
+                        if first.len() < 64 { first.extend_from_slice(&buf); }
+                    }
+                    Err(e) => { result = format!("read ERR {e}"); break; }
+                }
+            }
+            let (tlv_n, _) = t4s_core::graph::tlv_score(&first);
+            result = format!("total={total} first={:02x?} tlv_chain={tlv_n}", first);
+            src = Some(s);
+            Ok(())
+        })();
+        if let Err(e) = run { result = format!("ERR {e}"); }
+        drop(src);
+        if conn != 0 { let _ = drv.disconnect(dev, conn); }
+        if dev != 0 { let _ = drv.stop_device(dev); }
+        if ring != 0 { let _ = drv.force_reset_buffer(ring); let _ = drv.destroy_buffer(ring); }
+        if dev != 0 { let _ = drv.destroy_device(dev); }
+        if pipe != 0 { let _ = drv.stop_pipeline(pipe); let _ = drv.destroy_pipeline(pipe); }
+        if let Some(req) = saved { let _ = drv.configure_physical_tsi_request(&req); }
+        println!("tlvcap {result}");
+        return;
+    }
     if arg == "cleanup2" {
         let dev = 0xdu32;
         let conn = 0x1e009700u32;
