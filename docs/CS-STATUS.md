@@ -63,3 +63,32 @@ abs の実マップ（0x8000–0x10d7000）の外にあり、書き込みには�
 `config.full.yml`（BS6/CS12/BS4K6）で `/api/channels` 200 を一度確認。
 CS 登録時に API が不安定になるため、安定運用は BS/BS4K の
 `config/config.yml` に戻している。CS は `config.full.yml` で再現可能。
+
+## Phase 1 実機結果（追記）
+
+**CS の受信経路は特定できた。** 正解は **physical TSI0 → logical TSI0（remap なし）**。
+`T4S_CS_TSI_PORT=0` で CS2 を 8 秒取得すると **49,119,888 バイト**の生 TS が
+出力され、mirakc API の `?decode=0` でも 8 秒で **47,480,832 バイト**
+（先頭 `47 1f ...`）を取得できた。製品の 2K DEMUX が logical TSI0 を
+使うという静的解析結果と一致する。
+
+```
+# 正しい CS 経路
+t4s-tuner --type CS --channel CS2 --duration 8 -   # physical TSI0 -> logical TSI0
+```
+
+### 復号のブロッカー
+
+生 TS を `t4s-cas` に通すと、ECM 応答が
+`ECM not entitled/unsupported response (requires 0800)` で停止する。
+CS2（TBSチャンネル1）と CS8（ショップチャンネル）の両方で同じ。
+4S-C00AS1 の内蔵 CAS は CS 2K のプロバイダ 0x0800 に entitlement が
+無い可能性が高い。これはソフトウェアではなくカード契約/鍵の問題。
+
+CS を復号するには、CS 2K の契約済み B-CAS/ACAS カード、または
+正規の鍵供給が必要。`.111` のカードを流用してはいけない。
+
+### 現在の mirakc
+
+`config.full.yml`（BS6/CS12/BS4K6）で `/api/channels` 200。
+CS は `decode=0` で受信可能、`decode=1` は CAS entitlement で 404。

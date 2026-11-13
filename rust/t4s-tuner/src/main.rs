@@ -275,8 +275,13 @@ fn run_2k(args: &Args, deadline: Option<Instant>) -> Result<(), String> {
     let native_tsi = std::env::var("T4S_NATIVE_TSI").is_ok();
     // (physical TSI port, logical TSI port, use logical1->physical0 remap)
     let (physical_port, logical_port, remap) = if is_cs {
-        // Product 2K route: physical TSI1, logical TSI0.  No crossbar write.
-        (1, 0, false)
+        // Product 2K route: physical TSI1 -> logical TSI0 by default.
+        // T4S_CS_TSI_PORT=0 is a diagnostic for the alternate physical port.
+        let port = std::env::var("T4S_CS_TSI_PORT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        (port, 0, false)
     } else if native_tsi {
         (0, 0, false)
     } else {
