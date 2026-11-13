@@ -53,6 +53,50 @@ fn graph_dump(drv: &Arc<XcDrv>) {
 fn main() {
     let arg = std::env::args().nth(1).unwrap_or_default();
     let drv = Arc::new(XcDrv::open_path(t4s_core::xcdrv::DEV_PATH).expect("driver"));
+    if arg == "keyloop" {
+        for k in 0u32..0x200 {
+            if let Err(e) = tuner::send_raw_message(0x7F, 0x2044, 8, &[k, 0]) {
+                println!("send ERR {e}");
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(300));
+            let mut found = false;
+            if let Ok(rd) = std::fs::read_dir("/proc") {
+                for e in rd.flatten() {
+                    if let Ok(c) = std::fs::read_to_string(e.path().join("comm")) {
+                        let c = c.trim();
+                        if c.starts_with("MIXER") || c.starts_with("Sink") || c.starts_with("buf_buf") {
+                            println!("POWERKEY={k:#x} thread={c}");
+                            found = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            if found { return; }
+            if k % 32 == 0 { println!("scan {k:#x}"); }
+        }
+        println!("no power key found");
+        return;
+    }
+    if arg == "uimkey" {
+        let key: u32 = std::env::args().nth(2).and_then(|v| {
+            let t = v.trim();
+            if let Some(h) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) { u32::from_str_radix(h, 16).ok() } else { t.parse().ok() }
+        }).unwrap_or(0x0E);
+        let typ: u32 = std::env::args().nth(3).and_then(|v| v.parse().ok()).unwrap_or(0);
+        match tuner::send_raw_message(0x7F, 0x2044, 8, &[key, typ]) {
+            Ok(()) => println!("uimkey key={key:#x} type={typ}"),
+            Err(e) => { println!("uimkey ERR {e}"); return; }
+        }
+        std::thread::sleep(Duration::from_secs(3));
+        match t4s_core::gr_i2c::read_output_regs() {
+            Ok(r) => println!("lock={:#x} bank2={:?}", r.lock, r.bank2_selection),
+            Err(e) => println!("regs ERR {e}"),
+        }
+        println!("si={:?}", si::live_service(si::ADSB_SI_DIR).map(|l| (l.service_id, l.tlv_stream_id)));
+        return;
+    }
     if arg == "raw6004" {
         let dev: u32 = std::env::args().nth(2).and_then(|v| v.parse().ok()).unwrap_or(0);
         let (tsid, freq, bid) = channels::tuning_record(141).expect("141");
