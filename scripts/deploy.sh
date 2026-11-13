@@ -9,6 +9,11 @@ PORT=${HTTP_PORT:-8080}
 
 cp "$ROOT/config/config.yml" "$ROOT/config/strings.yml" "$HTTP/"
 cp "$ROOT/scripts/ondevice-up.sh" "$ROOT/scripts/ondevice-down.sh" "$HTTP/"
+# Bundle the static WebUI when a local build exists.
+WEBUI_DIST=${WEBUI_DIST:-$HOME/projects/mirakc-webui/dist}
+if [ -d "$WEBUI_DIST" ]; then
+    tar -C "$WEBUI_DIST" -cf "$HTTP/www.tar" .
+fi
 # Use the freshly built standalone crate binary when it exists; otherwise the
 # copy already in .tmp/http is transferred.
 REMOTE_BIN="$ROOT/rust/target/remote/armv7-unknown-linux-musleabihf/release/t4s-remote"
@@ -35,6 +40,15 @@ for f in mirakc t4s-tuner t4s-cas t4s-remote; do
 done
 wget -q http://192.168.100.100:$PORT/config.yml -O ../config.yml
 wget -q http://192.168.100.100:$PORT/strings.yml -O ../strings.yml
+if wget -T 20 -q http://192.168.100.100:$PORT/www.tar -O /tmp/www.tar; then
+  mkdir -p /mnt/t4s/opt/t4s/www
+  tar -xf /tmp/www.tar -C /mnt/t4s/opt/t4s/www
+  chown -R 0:0 /mnt/t4s/opt/t4s/www
+  find /mnt/t4s/opt/t4s/www -type d -exec chmod 755 {} \;
+  find /mnt/t4s/opt/t4s/www -type f -exec chmod 644 {} \;
+else
+  echo "www.tar not available, skipping WebUI"
+fi
 cd /media/usb
 wget -q http://192.168.100.100:$PORT/ondevice-up.sh -O ondevice-up.sh
 wget -q http://192.168.100.100:$PORT/ondevice-down.sh -O ondevice-down.sh

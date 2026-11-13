@@ -7,6 +7,10 @@ resource:
 server:
   addrs:
     - http: '0.0.0.0:40772'
+  mounts:
+    /www:
+      path: /opt/t4s/www
+      index: index.html
 
 # BS / CS 2K (ISDB-S) and BS4K (ISDB-S3).
 # channel 値の解釈は t4s-tuner が行う:
