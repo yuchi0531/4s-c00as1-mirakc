@@ -1,7 +1,7 @@
 //! `t4s-remote` — a LAN remote-control web UI for the SHARP 4S-C00AS1.
 //!
 //! The product's UI task takes remote-control keys off the Q_UIM System V
-//! queue (qid 0x7F, message 0x2044, 8-byte body `{u32 keyCode, u32 type}`;
+//! queue (qid 0x7F, message 0x12044, 8-byte body `{u32 keyCode, u32 type}`;
 //! type 0 = press, type 2 = release).  This server posts those messages with
 //! `t4s_core::tuner::send_raw_message` and serves a remote-control page over
 //! plain HTTP.
@@ -26,7 +26,11 @@ mod keys;
 /// Q_UIM: the product UI task's inbound queue.
 const Q_UIM: u32 = 0x7f;
 /// "Key event" message id on Q_UIM (the same path the front panel uses).
-const MSG_KEY: u32 = 0x2044;
+///
+/// The receiver's dispatch compares against `0x00012044`, not `0x2044`
+/// (docs/analysis/phase4-device-blue.md §2.1).  A message with `0x2044` is
+/// silently discarded and never updates the UIM "previous key".
+const MSG_KEY: u32 = 0x1_2044;
 const MSGH_LIST: &str = "/tmp/bdh_out_msgh.lst";
 const LOG_PATH: &str = "/tmp/t4s-remote.log";
 const PID_PATH: &str = "/tmp/t4s-remote.pid";

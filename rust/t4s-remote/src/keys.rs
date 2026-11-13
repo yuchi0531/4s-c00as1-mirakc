@@ -2,7 +2,7 @@
 //!
 //! Transcribed from `docs/analysis/phase4-ui.md` 2.4: abs resolves these names
 //! through a 318-entry pointer table at `.data` 0x1079FAC.  UIM accepts the same
-//! code space on both key paths (msg 0x2044 and msg 0x115C).
+//! code space on both key paths (msg 0x12044 and msg 0x1115C).
 
 pub const KEY_NAMES: [&str; 318] = [
     "RC_POWER",              // 0x000
