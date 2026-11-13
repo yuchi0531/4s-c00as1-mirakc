@@ -52,10 +52,59 @@ fn graph_dump(drv: &Arc<XcDrv>) {
 
 fn main() {
     let arg = std::env::args().nth(1).unwrap_or_default();
+    if arg == "osd" {
+        use std::io::Write;
+        use std::os::unix::io::AsRawFd;
+        extern "C" {
+            fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
+            fn munmap(addr: *mut u8, len: usize) -> i32;
+        }
+        const W: usize = 1920;
+        const H: usize = 1080;
+        let out = std::env::args().nth(2).unwrap_or_else(|| "/mnt/t4s/osd.ppm".into());
+        let phys = std::env::args().nth(3).and_then(|v| {
+            let t = v.trim();
+            let h = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")).unwrap_or(t);
+            usize::from_str_radix(h, 16).ok()
+        }).unwrap_or(0x3C88_4000);
+        let step: usize = std::env::args().nth(4).and_then(|v| v.parse().ok()).unwrap_or(1).max(1);
+        let file = std::fs::File::open("/dev/mem").expect("open /dev/mem");
+        let len = W * H * 4;
+        let base = unsafe { mmap(std::ptr::null_mut(), len, 1, 1, file.as_raw_fd(), phys as i64) };
+        if base as usize == usize::MAX {
+            eprintln!("mmap {phys:#x} failed: {:?}", std::io::Error::last_os_error());
+            return;
+        }
+        let (ow, oh) = (W / step, H / step);
+        let mut w = std::fs::File::create(&out).expect("create out");
+        write!(w, "P6\n{ow} {oh}\n255\n").expect("header");
+        for yy in 0..oh {
+            for xx in 0..ow {
+                let i = (yy * step) * W + xx * step;
+                let v = unsafe { std::ptr::read_volatile(base.add(i * 4) as *const u32) };
+                let rgb = [((v >> 16) & 0xff) as u8, ((v >> 8) & 0xff) as u8, (v & 0xff) as u8];
+                w.write_all(&rgb).expect("pixel");
+            }
+        }
+        unsafe { munmap(base, len) };
+        println!("osd phys={phys:#x} step={step} -> {out}");
+        return;
+    }
+    if arg == "putfile" {
+        let addr = std::env::args().nth(2).expect("addr");
+        let path = std::env::args().nth(3).expect("path");
+        let mut s = std::net::TcpStream::connect(&addr).expect("connect");
+        let mut f = std::fs::File::open(&path).expect("open");
+        match std::io::copy(&mut f, &mut s) {
+            Ok(n) => println!("sent {n} bytes to {addr}"),
+            Err(e) => println!("send ERR {e}"),
+        }
+        return;
+    }
     let drv = Arc::new(XcDrv::open_path(t4s_core::xcdrv::DEV_PATH).expect("driver"));
     if arg == "keyloop" {
         for k in 0u32..0x200 {
-            if let Err(e) = tuner::send_raw_message(0x7F, 0x2044, 8, &[k, 0]) {
+            if let Err(e) = tuner::send_raw_message(0x7F, 0x12044, 8, &[k, 0]) {
                 println!("send ERR {e}");
                 return;
             }
@@ -85,9 +134,17 @@ fn main() {
             if let Some(h) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) { u32::from_str_radix(h, 16).ok() } else { t.parse().ok() }
         }).unwrap_or(0x0E);
         let typ: u32 = std::env::args().nth(3).and_then(|v| v.parse().ok()).unwrap_or(0);
-        match tuner::send_raw_message(0x7F, 0x2044, 8, &[key, typ]) {
-            Ok(()) => println!("uimkey key={key:#x} type={typ}"),
+        let msgid: u32 = std::env::args().nth(4).and_then(|v| {
+            let t = v.trim();
+            let h = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")).unwrap_or(t);
+            u32::from_str_radix(h, 16).ok()
+        }).unwrap_or(0x12044);
+        match tuner::send_raw_message(0x7F, msgid, 8, &[key, typ]) {
+            Ok(()) => println!("uimkey key={key:#x} type={typ} msg={msgid:#x}"),
             Err(e) => { println!("uimkey ERR {e}"); return; }
+        }
+        if std::env::args().nth(5).is_some() {
+            return;
         }
         std::thread::sleep(Duration::from_secs(3));
         match t4s_core::gr_i2c::read_output_regs() {
