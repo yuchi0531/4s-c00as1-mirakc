@@ -360,6 +360,33 @@ $ POST /api/key {"name":"RC_BACK"}
   OSD 黒）、**CH_UP で SI を 151 に変える確認はできませんでした**。
   live view 復帰には製品側の電源/選局操作が必要です。
 
+### 8.3 WebUI のボタンがキーを送れない原因と修正（2026-11-14 00:12–00:22 JST）
+
+- ホストから `/api/status` / `/api/keys` を各 5 回: 成功時は 3–80 ms、
+  失敗時は `time_connect=0` で 5 s タイムアウト。**失敗したリクエストは
+  `/tmp/t4s-remote.log` に記録されません**（TCP 接続が確立していない）。
+  mirakc 40772 も同じ確率で失敗し、ping / telnet 2323 は通ります。
+- 従来の `respond` は **`Connection: close`** を返していました。`GET /` の
+  直後に TCP を閉じるため、次のボタン POST は毎回新しい SYN を要求し、
+  間欠的な SYN 損失に当たるたび失敗します。ブラウザ側 fetch の 8 s abort は
+  SYN 再送（1+2+4 s）の途中で切れることがありました。
+- Playwright で実ページの「情報」ボタンを押した結果:
+  - 修正前: `POST /api/key` が **1539 ms**（ページ接続は close 済みで新規 TCP）。
+  - keep-alive 修正後: 同じクリックが **93–97 ms**、HTTP 200、
+    `last_key=RC_INFO`、`primer 0x000`。`/api/status` も自動取得され画面表示。
+- 修正内容:
+  - 1 接続で複数リクエストを処理（`Connection: keep-alive` + read loop）。
+  - UI の fetch timeout を 8 → 15 s（key）/ 12 s（status）に延長。
+    ボタンは送信中に disable、statusline とログに成功/失敗理由を表示。
+  - ビルド版 `2026-11-14a` を header / footer / `/api/status` の `build` に表示。
+  - 画面表示時に `/api/status` を自動取得し、`last_key` / UIM / SI を表示。
+  - `0x12044` の msgsnd が失敗した場合のみ `0x1115C` にフォールバック。
+  - `ondevice-up.sh` で `somaxconn` / `tcp_max_syn_backlog` を 1024 に
+    上げる（best-effort、失敗しても起動は継続）。
+- **実機検証は電源再投入待ち**。復帰後に `/api/status` で MIXER/Sink=true,
+  SI=141/45170 を確認し、キー送信は INFO 1 回だけ（type0 → 80 ms → type2）で行います。
+  `t4s-probe uimkey` を直接使う場合も type0 単独ではなく type2 を対で送ってください。
+
 ---
 
 ## 9. 既知の制約

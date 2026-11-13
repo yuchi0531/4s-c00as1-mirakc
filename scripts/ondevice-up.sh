@@ -81,4 +81,14 @@ start_remote() {
     return 0
 }
 
+# Browser bursts (page + status + key POSTs) were overflowing the listen/SYN
+# queues; the host saw ~2/5 connections to 8484 fail while mirakc 40772 did
+# too.  Raise the queues best-effort.  A failure here must not affect boot.
+if [ -w /proc/sys/net/core/somaxconn ]; then
+    echo 1024 > /proc/sys/net/core/somaxconn 2>/dev/null || true
+fi
+if [ -w /proc/sys/net/ipv4/tcp_max_syn_backlog ]; then
+    echo 1024 > /proc/sys/net/ipv4/tcp_max_syn_backlog 2>/dev/null || true
+fi
+
 start_remote

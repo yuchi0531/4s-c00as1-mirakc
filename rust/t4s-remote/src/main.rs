@@ -31,6 +31,11 @@ const Q_UIM: u32 = 0x7f;
 /// (docs/analysis/phase4-device-blue.md §2.1).  A message with `0x2044` is
 /// silently discarded and never updates the UIM "previous key".
 const MSG_KEY: u32 = 0x1_2044;
+/// Secondary key route; only used if `0x12044` cannot be queued.  Both are
+/// accepted by UIM, but `0x12044` is the front-panel path and the default.
+const MSG_KEY_FALLBACK: u32 = 0x1_115C;
+/// Shown in the UI footer / status so a stale browser tab is obvious.
+const BUILD: &str = "2026-11-14a";
 const MSGH_LIST: &str = "/tmp/bdh_out_msgh.lst";
 const LOG_PATH: &str = "/tmp/t4s-remote.log";
 const PID_PATH: &str = "/tmp/t4s-remote.pid";
@@ -163,7 +168,11 @@ fn daemonize(log_path: &str) -> io::Result<()> {
 }
 
 fn raw(code: u32, kind: u32) -> io::Result<()> {
-    tuner::send_raw_message(Q_UIM, MSG_KEY, 8, &[code, kind])
+    match tuner::send_raw_message(Q_UIM, MSG_KEY, 8, &[code, kind]) {
+        Ok(()) => Ok(()),
+        Err(primary) => tuner::send_raw_message(Q_UIM, MSG_KEY_FALLBACK, 8, &[code, kind])
+            .map_err(|_| primary),
+    }
 }
 
 /// Send one key: primer (when needed), press, then release after 80 ms.
@@ -333,7 +342,7 @@ fn reason(status: u16) -> &'static str {
 fn respond(stream: &mut TcpStream, status: u16, ctype: &str, body: &[u8]) {
     let head = format!(
         "HTTP/1.1 {status} {}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\n\
-         Cache-Control: no-store\r\nConnection: close\r\n\r\n",
+         Cache-Control: no-store\r\nConnection: keep-alive\r\n\r\n",
         reason(status),
         body.len()
     );
@@ -762,6 +771,7 @@ fn status_json(state: &State) -> String {
         hits[0], hits[1], hits[2], hits[3]
     );
     let fields = [
+        format!("\"build\":\"{BUILD}\""),
         format!("\"now\":{now}"),
         format!("\"time\":\"{}\"", hms(now)),
         format!("\"uptime_s\":{uptime}"),
@@ -778,28 +788,47 @@ fn handle_conn(mut stream: TcpStream, state: Arc<State>) {
     let _ = stream.set_nodelay(true);
     let _ = stream.set_read_timeout(Some(CONN_TIMEOUT));
     let _ = stream.set_write_timeout(Some(CONN_TIMEOUT));
-    let started = Instant::now();
-    match read_request(&mut stream) {
-        Ok(request) => {
-            let (status, ctype, body) = route(&state, &request);
-            log(&format!(
-                "{} {} -> {} ({} bytes, {} ms)",
-                request.method,
-                request.path,
-                status,
-                body.len(),
-                started.elapsed().as_millis()
-            ));
-            respond(&mut stream, status, ctype, &body);
-        }
-        Err(e) => {
-            log(&format!("bad request: {e}"));
-            respond(
-                &mut stream,
-                400,
-                "text/plain; charset=utf-8",
-                format!("bad request: {e}\n").as_bytes(),
-            );
+    // Serve requests until the client closes or idles out.  Browsers reuse a
+    // keep-alive connection for the next button press, so a flaky LAN does not
+    // need a fresh TCP/SYN for every key.
+    let mut served = 0u32;
+    loop {
+        let started = Instant::now();
+        match read_request(&mut stream) {
+            Ok(request) => {
+                let (status, ctype, body) = route(&state, &request);
+                log(&format!(
+                    "{} {} -> {} ({} bytes, {} ms)",
+                    request.method,
+                    request.path,
+                    status,
+                    body.len(),
+                    started.elapsed().as_millis()
+                ));
+                respond(&mut stream, status, ctype, &body);
+                served += 1;
+            }
+            Err(e) => {
+                if served == 0
+                    && !matches!(
+                        e.kind(),
+                        io::ErrorKind::UnexpectedEof
+                            | io::ErrorKind::WouldBlock
+                            | io::ErrorKind::TimedOut
+                            | io::ErrorKind::ConnectionReset
+                            | io::ErrorKind::BrokenPipe
+                    )
+                {
+                    log(&format!("bad request: {e}"));
+                    respond(
+                        &mut stream,
+                        400,
+                        "text/plain; charset=utf-8",
+                        format!("bad request: {e}\n").as_bytes(),
+                    );
+                }
+                break;
+            }
         }
     }
 }
@@ -859,7 +888,8 @@ fn main() {
     };
     let _ = std::fs::write(PID_PATH, format!("{}\n", std::process::id()));
     log(&format!(
-        "t4s-remote pid={} listening on {bind}:{port} (Q_UIM qid {Q_UIM:#x}, msg {MSG_KEY:#x})",
+        "t4s-remote pid={} build={BUILD} listening on {bind}:{port} \
+         (Q_UIM qid {Q_UIM:#x}, msg {MSG_KEY:#x}, fallback {MSG_KEY_FALLBACK:#x})",
         std::process::id()
     ));
     log("unauthenticated LAN-only remote; primer is inserted per key as needed");

@@ -124,7 +124,7 @@
 <header>
   <h1>4S-C00AS1 <span>Remote</span></h1>
   <div class="head-tools">
-    <span id="pill" class="pill">未確認</span>
+    <span id="pill" class="pill">v2026-11-14a · 未接続</span>
     <button id="status-btn" class="small">status</button>
   </div>
 </header>
@@ -233,6 +233,7 @@
 </main>
 
 <footer>
+  <code>UI v2026-11-14a</code> · <code>msgId 0x12044</code> ·
   <strong>認証なし・LAN 専用。</strong>
   <code>0.0.0.0:8484</code> を信頼できるネットワーク内でのみ公開してください。
   リモコン受光部が壊れているため、この UI は Q_UIM (qid 0x7F, msg 0x12044) に
@@ -247,6 +248,7 @@
   const pill = document.getElementById('pill');
   const statusline = document.getElementById('statusline');
   const MAX_LOG = 80;
+  const UI_VERSION = '2026-11-14a';
 
   const hex = (code) => '0x' + Number(code).toString(16).padStart(3, '0').toUpperCase();
   const clock = () => new Date().toTimeString().slice(0, 8);
@@ -269,9 +271,10 @@
   }
 
   // A dropped SYN or a busy product can hold a request open for tens of
-  // seconds.  Abort so a button press reports a failure instead of appearing
-  // to do nothing forever.
-  async function fetchWithTimeout(path, opts = {}, timeoutMs = 8000) {
+  // seconds.  Allow enough time for the kernel's SYN retries (1+2+4 s), then
+  // abort so a button press reports a failure instead of appearing to do
+  // nothing forever.  Keep-alive makes the normal path much faster.
+  async function fetchWithTimeout(path, opts = {}, timeoutMs = 15000) {
     const ctl = new AbortController();
     const timer = setTimeout(() => ctl.abort(), timeoutMs);
     try {
@@ -292,9 +295,11 @@
     return { res, data };
   }
 
-  async function sendKey(code, opts = {}) {
+  async function sendKey(code, opts = {}, button = null) {
     const label = nm(code);
     const t0 = performance.now();
+    if (button) button.disabled = true;
+    statusline.textContent = `送信中: ${label} ${hex(code)} …`;
     try {
       const { res, data } = await post('/api/key', { code, ...opts });
       const ms = Math.round(performance.now() - t0);
@@ -302,9 +307,18 @@
       logLine(res.ok && data.ok ? 'ok' : 'err',
         `${clock()} ${label} ${hex(code)} → HTTP ${res.status} (${ms}ms)${extra}`);
       if (data.error) logLine('err', `  ${data.error}`);
-      statusline.textContent = `最終キー: ${label} ${hex(code)} @ ${clock()} · HTTP ${res.status}`;
+      statusline.textContent = `最終キー: ${label} ${hex(code)} @ ${clock()} · HTTP ${res.status} (${ms}ms)`;
+      if (!(res.ok && data.ok)) {
+        statusline.textContent += ` · 失敗: ${data.error || res.status}`;
+      }
     } catch (err) {
-      logLine('err', `${clock()} ${label} ${hex(code)} → 送信失敗: ${err}`);
+      const reason = err && err.name === 'AbortError'
+        ? 'タイムアウト（接続失敗）。再読み込みして再試行してください'
+        : String(err);
+      logLine('err', `${clock()} ${label} ${hex(code)} → 送信失敗: ${reason}`);
+      statusline.textContent = `送信失敗: ${label} ${hex(code)} · ${reason}`;
+    } finally {
+      if (button) button.disabled = false;
     }
   }
 
@@ -363,7 +377,7 @@
       flash(button);
       const code = Number(button.dataset.code);
       const opts = button.dataset.type ? { type: Number(button.dataset.type) } : {};
-      sendKey(code, opts);
+      sendKey(code, opts, button);
     });
   });
 
@@ -381,7 +395,7 @@
 
   async function refreshStatus() {
     try {
-      const res = await fetchWithTimeout('/api/status', {}, 10000);
+      const res = await fetchWithTimeout('/api/status', {}, 12000);
       const s = await res.json();
       const threads = Object.entries(s.threads || {})
         .filter(([, on]) => on).map(([k]) => k).join('/') || 'なし';
@@ -397,7 +411,7 @@
       const last = s.last_key
         ? `${s.last_key.name}(${hex(s.last_key.code)}) ${s.last_key.age_s}s 前`
         : 'なし';
-      pill.textContent = `up ${s.uptime_s}s · ${q}`;
+      pill.textContent = `v${s.build || UI_VERSION} · up ${s.uptime_s}s · ${q}`;
       statusline.textContent = `uptime ${s.uptime_s}s · ${q} · ${si} · ${regs} · threads ${threads} · 最終キー ${last}`;
       logLine('info', `${clock()} status: ${statusline.textContent}`);
     } catch (err) {
@@ -429,7 +443,10 @@
     sendKey(code, {});
   });
 
-  logLine('info', `${clock()} UI ready · 認証なし・LAN 専用`);
+  logLine('info', `${clock()} UI ready v${UI_VERSION} · msgId 0x12044 · 認証なし・LAN 専用`);
+  // Populate last_key/UIM state without waiting for a manual status press.
+  // It runs after the click handlers are installed and does not block keys.
+  refreshStatus();
 })();
 </script>
 </body>
