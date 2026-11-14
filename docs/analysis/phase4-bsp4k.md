@@ -1059,9 +1059,7 @@ host tap が健全であることを保証しない。
 
 ## 16. 追記（2026-11-15）: 4K tap の teardown と os error 1038
 
-> 実機は Err（本体ボタン復帰待ち）のため、本節はホスト側のコード解析・修正・
-> ユニットテストのみ。実機アクセス・電源操作は行っていない。実機検証は §16.5 の
-> 手順を復帰後に実施する。
+> 実機検証は §16.7 に記載（2026-11-15、3 回連続取得で合格）。
 
 ### 16.1 1038 の正体と発生箇所
 
@@ -1155,7 +1153,7 @@ host tap が健全であることを保証しない。
 `cargo check --workspace --release --target armv7-unknown-linux-musleabihf` → 成功
 （既存の `t4s-call` の未使用 import/dead_code 警告のみ）。
 
-### 16.5 実機復帰後の検証手順（未実施）
+### 16.5 実機復帰後の検証手順（**実施済み → §16.7**）
 
 前提: 本体ボタンで緑復帰済み。**1038 が出たら 0x6004 を送らない**（§15.4）。
 
@@ -1184,7 +1182,6 @@ host tap が健全であることを保証しない。
 
 ### 16.6 未検証・残課題
 
-- 実機での 3 回連続取得は **未検証**（実機 Err のため）。
 - TSOUT ring は製品リテラルの 0x468000（4.5 MiB）のまま。ホスト読み出しが
   4K の実ビットレートに追いつかない場合は、drain だけでは writer を解けず
   再び 1038 になる可能性がある（**推測**。2K のように ring 拡大が必要になるかは
@@ -1192,3 +1189,49 @@ host tap が健全であることを保証しない。
 - `discover=Ok` は製品デコードの健全性しか保証せず、host tap の残骸は検出しない
   （§15.7 の観測どおり）。今回の修正は「残骸を作らない」方向の対策であり、
   既に wedged な個体をソフトで解放するものではない。
+
+### 16.7 実機検証（2026-11-15 00:26–00:33 JST、**合格**）
+
+ユーザーが再起動 → 本体ボタンで緑復帰（`si=141/45170`, `discover=Ok(readers 1/2)`,
+uptime 68 s）。mirakc/t4s-remote は未起動の状態で検証を実施。
+
+**ビルド・配置**
+
+| 項目 | 値 |
+|---|---|
+| ソース | HEAD `a11000f`（remux4k teardown 修正入り） |
+| ビルド | `cargo +1.99.0 build --release --target armv7-unknown-linux-musleabihf -p t4s-tuner`（9.55 s, 成功） |
+| `cargo test -p t4s-core` | **150 passed / 0 failed** |
+| ホスト binary | 566,228 B / md5 `93e48326949601be314e1478f66e73fe` |
+| 旧 device binary | 552,884 B / md5 `43c416c53b99fa9d54a8e47018691b6e`（Nov 14 04:03 = 修正前） |
+| 配置 | `/tmp/new-tuner` へ wget（md5 一致）→ `cp` で `/mnt/t4s/opt/t4s/bin/t4s-tuner` を置換、`chmod 755`。旧版は `t4s-tuner.old` に退避 |
+| 配置後 md5 | **`93e48326949601be314e1478f66e73fe`**（一致）, 566,228 B, `-rwxr-xr-x` |
+
+**3 回連続取得（各回 10 秒以上あけ、`--type BS4K --channel 45170 --duration 10`）**
+
+| 回 | rc | bytes | 先頭 4 B | `os error 1038` | `teardown could not release` | 取得後 discover | teardown drain |
+|---:|---:|---:|---|---:|---:|---|---|
+| 1 | 0 | 30,822,976 | `47 40 00 10` | 0 | 0 | Ok(1,2,8) | 982,656 B |
+| 2 | 0 | 31,138,440 | `47 40 00 10` | 0 | 0 | Ok(1,2,8) | 576,000 B |
+| 3 | 0 | 31,100,276 | `47 40 00 10` | 0 | 0 | Ok(1,2,8) | 1,124,352 B |
+
+- **合格条件をすべて満たした**: 3 回とも rc=0 / bytes>0 / 1038 なし / teardown leak なし、
+  かつ各回後・全 3 回通して `discover=Ok(readers 1/2)` を維持（製品デコードは無傷）。
+- 旧バイナリでは同条件で `os error 1038`（REMUX open failed）が再現していた（§15.7 CV-A/C）。
+  修正版は 3 回連続で 1038 を出さず、**teardown 修正の実機効果を確認**。
+
+**ffprobe（run 1 を host へ putfile、`.tmp/tap4k/run1-45170.ts`）**
+
+- container mpegts / 188 B TS / sync ratio **1.0**。
+- video: **hevc / Main 10 / 3840x2160 / yuv420p10le / color_transfer=arib-std-b67 (HLG) /
+  color_primaries=bt2020**。
+- audio: **aac_latm / LC / 48000 Hz / 2ch**。
+
+**mirakc 起動**
+
+- `sh /media/usb/ondevice-up.sh` → mirakc pid 989 / t4s-remote pid 993（8484）。
+- 起動後 `/api/status`: `MIXER/Sink/buf_buf=true`, `si=141/45170`, `discover=Ok(1,2)`
+  を維持。**API の 4K 連続取得は行っていない**（§15.3 の Err 主因のため）。
+
+**結論**: remux4k teardown 修正（`a11000f`）により、4K tap を 3 回連続で開閉しても
+`os error 1038` を起こさず、緑状態を維持したまま反復取得できることを実機で確認した。
