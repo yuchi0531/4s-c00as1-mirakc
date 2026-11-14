@@ -453,3 +453,178 @@ loadavg は ~27（再起動直後の一時的上昇で収束傾向）。
 
 `send 141 0 0` や `t4s-tuner` は 1 回も実行しておらず、`.tmp/w4k-*` も生成していない
 （実機状態は未変更）。実機が復旧したら、§10 の「12 秒窓」仮説を改めて検証する。
+
+---
+
+## 12. 追記（2026-11-14 JST）: ソフト偽装の調査 — XCFB ioctl とシンク present ゲート
+
+HDMI シンク無しで 4K デコードを起こすための**最小のソフト手段**を、ホスト上の
+逆アセンブル（`.tmp/oem/abs`, `.tmp/abs.dis`, `.tmp/abs-refs.pkl`, `.tmp/oem/xcdrv.ko`）
+だけで特定する。実機はオフラインのため一切触っていない。**本節は read-only 解析のみ**。
+
+### 12.1 最重要の確定事項: ioctl 要求番号は固定 `0x61000`
+
+`abs` の `/dev/xcfb_disp` 利用箇所（`vOutDriverMain`, `VID_PlayAnimationTask`,
+`Debug_Dfb_Debug`, `Disc_Access_IF_Thread` 内の HDMI_SYS 群、`HDMI_DrvEvent`,
+`HDMI_Hdcp`）を全数走査した結果、**`_IOR/_IOW` 合成ではなく、要求番号は常に
+リテラル `mov.w r1, #0x61000`**（188 ioctl 中、XCFB 系はすべてこれ）。
+コマンド種別は要求番号ではなく、**引数 struct の先頭ワード**に入る。
+
+逆アセンブルから復元した引数 struct（16 バイト）:
+
+```c
+struct xcfb_disp_arg {
+    u32 cmd;    // +0x00  XCFB_CMD_DISP_* （下の表）
+    u32 token;  // +0x04  HDMI_LOCK(0x500) が返すセッショントークン
+    u32 arg1;   // +0x08  コマンド依存（in/out）
+    u32 arg2;   // +0x0c  コマンド依存（in/out）
+};
+ioctl(fd, 0x61000, &arg);
+```
+
+- 根拠: `abs:0x22dcc8`（`HDMI_SYS_XcfbDispCommand` の実体）。冒頭で
+  `cmd=0x500` を `[r7,#0x10]` に置いて `ioctl(fd,0x61000,r7+#0x10)` を発行し、
+  戻り値の `[r7,#0x14]`（= token）をグローバル `0x1449a38` に保存（`0x22dd2a`-`0x22dd32`）。
+  次に `[r7,#0x10]=cmd`, `[r7,#0x14]=token`, `[r7,#0x18]=*arg1ptr`,
+  `[r7,#0x1c]=*arg2ptr` を組み、再度 `ioctl(fd,0x61000,r7+#0x10)`（`0x22dd34`-`0x22dd5e`）。
+  戻り後 `[r7,#0x18]`→`*arg1ptr`, `[r7,#0x1c]`→`*arg2ptr` を書き戻す（in/out）。
+  末尾で `cmd=0x501`（UNLOCK）を送る。
+- `HDMI_SYS_TMDS_Enable`（`abs:0x22eb46`）は同じレイアウトを直接組み立てるため、
+  READ_REG/WRITE_REG の `arg1`/`arg2` の意味がこの経路で読める（§12.3）。
+- **LOCK/UNLOCK (0x500/0x501) はディスプレイ排他ミューテックス**であり、
+  HDMI レジスタや HPD/EDID を書き換えるコマンドではない。製品自身も
+  EDID 読みの前後で必ずこのペアを発行している（`0x2365a0` の前段）。
+
+### 12.2 XCFB ioctl 番号表（cmd 名 → 引数 struct の cmd 値）
+
+`request` 列は全行 `0x61000`。`arg1`/`arg2` は struct の +0x08/+0x0c。
+「出所」はこの値を組んでいる `abs` の関数（すべて `Disc_Access_IF_Thread` 配下の
+HDMI_SYS 群の内部名）。
+
+| cmd 値 | 名前 | arg1 | arg2 | 出所 / 根拠 |
+|---|---|---|---|---|
+| 0x500 | `XCFB_CMD_DISP_HDMI_LOCK` | — | — | 全 HDMI_SYS 関数（`0x22dcf2` 他） |
+| 0x501 | `XCFB_CMD_DISP_HDMI_UNLOCK` | — | — | 同上 |
+| 0x516 | `..._HDMI_SET_SPD` | SPD 構造体 | — | `HDMI_SYS_SendSpdInfo` (`0x22d6a0`) |
+| 0x51a | `..._HDMI_HDCP_SET_SRM_LIST` | list ptr | — | `HDMI_SYS_HDCP_SetSRM_List` (`0x22e1b6`) |
+| 0x51c | `..._HDMI_HDCP_SET_CFG` | cfg | — | `HDCP_SetStreamContentType`/`SetDelay` (`0x22e424`,`0x22e69e`) |
+| 0x520 | `..._HDMI_READ_REG` | reg addr (in) | 値 (out) | `TMDS_Enable` (`0x22ece6`,`0x22ed42`) |
+| 0x521 | `..._HDMI_WRITE_REG` | reg addr | 値 | `TMDS_Enable` (`0x22ebda`,`0x22ec68`,…) |
+| 0x523 | （plug state） | HPD (out) | — | `Disc_Access_IF_Thread` plug 判定 (`0x22d8f0`) |
+| 0x524 | （plug state 拡張） | RSEN (out) | — | 同 (`0x22d90e`)。`combined=0x523 | 0x524<<1` |
+| 0x52c | `..._HDMI_SET_METADATA` | meta ptr | len | `HDMI_SYS_HDR_SetMetadata` (`0x22dff2`) |
+| 0x50b | `..._HDMI_EDID_GET_BLOCK_NUM` | block 数 (out) | — | `HDMI_Hdcp` EDID_Read_ROM (`0x2365b8`) |
+| 0x50c | `..._HDMI_EDID_READ_BLOCK` | block index | buf ptr | 同 (`0x23660c`) |
+| 0x534 | （TMDS delay powerup） | — | — | `HDMI_SYS_TMDS_SetDelay` (`0x22e9f4`) |
+| 0x535 | （TMDS delay setup） | — | — | 同 (`0x22e8fa`) |
+
+下位（非 HDMI）コマンドも同じ request 0x61000 を使う（表外の補足）:
+
+| cmd 値 | 名前 | 出所 |
+|---|---|---|
+| 0x200 / 0x201 | `..._SCREEN_LOCK` / `..._SCREEN_UNLOCK` | `VID_SetScreenDitherMode` (`1ecc2c`,`1ecd24`) |
+| 0x210 相当 | `..._SCREEN_SET_DITHER_MODE` | 同 (`1eccf0`、mode は [r7,#0x10]) |
+| 0x300 / 0x301 | `..._LAYER_LOCK` / `..._LAYER_UNLOCK` | `vOutDriverMain`/`Debug_Dfb_Debug` 他 |
+| 0x30d | `..._LAYER_SET_OPACITY` | 同 |
+| 0x31d / 0x31e | `..._LAYER_SET_FILTER_PARAM` / `..._GET_FILTER_PARAM` | `VID_PlayAnimationTask`/`Debug_Dfb_Debug` |
+| 0x700 / 0x701 / 0x702 | `..._BLANK_GEN_LOCK` / `...,SET_CONFIG` / `...,UNLOCK` | `VID_PlayAnimationTask` (`1f143a`…) |
+
+**未確定**: 0x523/0x524 の bit 割り当ては `abs` のログ文字列
+（`Cable State <HPD|RSEN>` と `and #3` 分岐）からの推定で、値の並び
+（`0x523` が HPD か RSEN か）は実機で 1 回読むまで確定しない。`combined` の
+計算式 `a523 | (a524 << 1)` 自体は逆アセンブルで確定（`0x22d924`）。
+
+### 12.3 READ_REG / WRITE_REG の引数と意味
+
+`HDMI_SYS_TMDS_Enable`（`abs:0x22eb46`〜`0x22f034`）が唯一の読み書き実装:
+
+- `READ_REG`: `{cmd=0x520, token, addr, 0}` を ioctl → 値は `arg2`。
+  `abs:0x22ed2c` に `Read reg (addr, data) = (0x%04X, 0x%04X)`。
+- `WRITE_REG`: `{cmd=0x521, token, addr, value}`。
+- この関数は TMDS 有効化のため `0x3000`/`0x3004`/`0x3020` 等の XCode6 HDMI
+  レジスタを読み書きする。**どのレジスタが HPD/EDID を操作できるかは未確定**
+  （xcfb の .ko 本体が `.tmp/oem/` に無く、カーネル ioctl ハンドラを読めない）。
+  ホスト上に `xcfb_disp` の登録元モジュールは見つからなかった
+  （`find .tmp -iname '*xcfb*'` は 0 件、`xcdrv.ko` の strings に `xcfb` は無い）。
+  **したがって WRITE_REG でシンク状態を作り込む道は、いまは根拠が無い。**
+
+### 12.4 シンク present ゲートの結論
+
+- HDMI 制御は `abs` の `HDMI_Main`(0x22f108) / `HDMI_Event`(0x232f60) /
+  `HDMI_DrvEvent`(0x2348a4) / `HDMI_Hdcp`(0x234989) の 4 関数群が担い、
+  **HPD/EDID の読みは上記 XCFB ioctl 経由で xcfb ドライバに委譲**している。
+- シンク状態のグローバルは `fSendHpdRise`(0x1449a80), `tHdmiCableStat`(0x1449a88),
+  `eHdmiAudioConn`(0x1e6d64c), `gHdmiDelay`(0x1253420)。このうち `.text` から
+  直接参照されるのは `tHdmiCableStat`（`0x22d460` で `0` クリア）のみで、
+  他は data.rel.ro 経由の間接参照だった。
+- abs 側に **「シンク present を強制する」分岐は存在しない**。むしろ
+  `eAvmTesttoolSetESDecRangeForce`（`0x4895ac`）・`eAvmTesttoolSetHdmiOutChange`
+  （`0x4895e8`）・`eAvmTesttoolSetHdmiSubCapable`（`0x489684`）という
+  **テストツール用のフック**が存在し、`cget_integer` で値を受け取って AVM の
+  強制フラグ（`0x10379e4` 周辺）を書き換える。ただしこれらは
+  **AVM 内部のデコード対象レンジ/HDMI 出力切替のフラグ**であり、
+  「HDMI シンクが無いのに present にする」ものではない（`SetHdmiOutChange` は
+  `0/1` を `0x489898` のテストフックで切替）。デコード開始の可否そのものを
+  単一フラグで立てる経路は、abs の `vAvmMain`(0x4581c4) 側には見当たらない。
+- `adsb` 側には `vAdsbAvmMain`(0x30be8) があり、`FDC_EVENT_AVM_START_VIDEO_DECODE`
+  を処理する。`0x312cc`/`0x31344` は FDC メッセージ（`fdc_sysSendMessage`）を
+  送るだけで、**HDMI シンクの有無を判定する分岐は adsb 側にも無い**。
+- **結論（推定を含む）**: ゲートは「HDMI 接続 → HDMI_Event/DbEdid が
+  HPD/EDID を確定 → AVM が出力解像度を確定 → ADSB が decode 開始」という
+  **連鎖の最終段が、xcfb ドライバが返すシンク状態に依存**している。単一の
+  ソフトフラグ（`fSendHpdRise` 等）を立てるだけでは decode は始まらない
+  可能性が高い。**xcfb の ioctl ハンドラ本体（未入手）を読むまで断定しない。**
+- 前後の実機テスト（§9/§10）と合わせた作業仮説:
+  - 選択肢1（EDID エミュレータ/ダミープラグ）が依然**最も確実**。
+  - ソフトのみで行くなら、`0x523`/`0x524`（plug state）を read して
+    HPD/RSEN の実値を確認し、もし「シンク無し」を返すのであれば、
+    xcfb ハンドラの READ/WRITE_REG で HPD を模擬できるかが唯一の突破口。
+  - そのためには **xcfb_disp を実装する .ko の入手**が必須（現状は未取得）。
+
+### 12.5 read-only プローブ `t4s-probe xcfb`
+
+`.tmp/http/t4s-probe`（armv7-musl, sha256 `24bb7600…c32a`）に実装を追加した。
+実機未接続のため**配置していない**。実機復帰後に転送して使う。
+
+- 使い方: `t4s-probe xcfb [reg_hex]`
+  1. `/dev/xcfb_disp` を O_RDWR で open（製品と同じ `open64(path,2)`）。
+  2. `HDMI_LOCK`(0x500) を発行してトークンを取得。
+  3. `plug_state`: `0x523`→`arg1`(HPD 想定)、`0x524`→`arg1`(RSEN 想定)、
+     `combined = hpd | (rsen<<1)` を 16 進表示。
+  4. `read_reg`（既定 0x3004,0x3000,0x3020,0x3006。引数で 1 つ指定可）を
+     `0x520` で read し 16 進表示。
+  5. `edid_block_count`（`0x50b`）と、あれば先頭 4 ブロックを
+     `EDID_READ_BLOCK`（`0x50c`）で読み、先頭 8 バイトと標準ヘッダ
+     `00 ff ff ff ff ff ff 00` の有無を判定。
+  6. `HDMI_UNLOCK`(0x501)。
+- **write 系 ioctl は実装していない**（`0x521` WRITE_REG, `0x516` SPD,
+  `0x51a`/`0x51c` HDCP, `0x52c` SET_METADATA は送らない）。将来 `--write` を
+  足す場合もフラグで分離し、既定は read-only のままにする。
+- 判定基準:
+  - `plug_state` の `combined` が 0（HPD=0,RSEN=0）→ シンク無し。製品の
+    `Cable State <None>` と一致するはず。
+  - `edid_block_count == 0` または `std_header=false` → EDID が読めない。
+  - どちらも「シンク無し」を示すなら、§9.4/§10 の観測と整合。
+
+### 12.6 実験計画（実機復帰後・read-only から）
+
+1. **状態観測（read-only）**: `t4s-probe xcfb` を 1 回だけ実行。
+   - `plug_state`, `read_reg`(0x3004 等), `edid_block_count`, 先頭 EDID を記録。
+   - 併せて §10 の read-only 手順（`si`, `discover`, `devices count`, bank2,
+     `/proc/interrupts` の `HDMI Audio` 増分）を取得。
+   - **判定**: HPD/RSEN と EDID が「無し」を返すか。返せば「シンク無し」確定。
+2. **xcfb ハンドラの入手**: 実機の `/lib/modules/3.10.24/` から xcfb_disp の
+   .ko を read-only で吸い出し、`READ_REG`/`WRITE_REG` のレジスタ意味を確定。
+   （本ホストには未取得。ここが唯一の未確定点。）
+3. **最小 write の検討**（まだ実施しない）: 手順2で「HPD を模擬できるレジスタ」
+   が判明した場合に限り、`--write` を別フラグで実装。1 レジスタ・1 回から。
+   - **ウォッチドッグ注意**: §9.4 / phase4-ui §4.4 の通り、画面・xcfb を
+     触った後に再起動が観測された事例がある。write は 1 回ごとに間隔を空け、
+     直後に `t4s-probe xcfb` と OSD グリッドで状態を確認。異常時は reboot。
+   - IOMMU/DMA を持つ HDMI サブシステムへの無根拠な write は、
+     ブリックにつながるため**行わない**。
+
+### 12.7 本節の状態保全
+
+実機はオフラインのまま。ホスト上で完結し、`t4s-probe` のビルドのみ実施。
+`.tmp/http/t4s-probe` を更新（実機未配置）。mirakc・電源操作・実機アクセスは無し。
