@@ -1,5 +1,12 @@
 # Phase 4 — 青状態で BSP4K (NHK BS4K) の TS 取得と 4K 全局検証
 
+> **用語の訂正（2026-11-14）**: 本文書（§0–§13）が「青状態」と呼んでいるのは、
+> 実際には **製品が 4K を実デコードしている視聴状態（`MIXER/Sink/buf_buf=true`,
+> `discover=Ok(readers≥1)`）** を指す。本体 LED の色ではなく、
+> **「緑状態（視聴状態）」** と読み替えること。§14 以降は「緑状態」表記に統一する。
+> （前段の「青＝電源ON/HDMI接続」という呼称は LED 色の見た目に引きずられたもので、
+> 検証で本質的なのは **デコードが live かどうか**であることが判明した。）
+
 対象: SHARP 4S-C00AS1（ViXS XCode6, ARMv7, Linux 3.10.24）
 日時: 2026-11-13 21:43–21:55 JST（青ランプ、HDMI 接続、製品 UI が 4K を視聴中）
 制約: ストレージ削除なし。書込みは USB `/mnt/t4s` と Q_UIM メッセージのみ。
@@ -861,3 +868,151 @@ abs は `T_FPM`(tid 392), `T_FPD`(315), `T_FPD3`(363), `T_FPM_DISP`(639),
 4. 本体ボタンで青に入る経路は前面マイコン FPD/FPM → UIM で、電源ON 時の
    前回チャンネル復元（`eSdmGetLastChInfo` → `WAIT_TUNE_LAST_CH`）と推定。
    ソフトリブートが復帰しない差は起動種別の差で説明できる（未確定）。
+
+---
+
+## 14. 追記（2026-11-14 21:32–22:27 JST）: HDMI なしでの 4K チャンネル切替検証
+
+対象: SHARP 4S-C00AS1。HDMI は物理的に不在（§13.4 で HPD=0/RSEN=0/EDID=0 確定）。
+実機は 21:19 / 21:52 に**ユーザーが本体ボタンで再起動**し、21:32:33 に**緑状態**
+（`MIXER/Sink/buf_buf=true`, `si=141/45170`, `discover=Ok(readers 1/2)`）へ復帰した。
+制約: キー連打・0x6004 連投・電源/reboot は行っていない。
+
+### 14.1 ベースラインと live を壊さない取得（t4s-tuner 直接）
+
+緑（21:33）で `t4s-tuner --type BS4K --channel 45170 --duration 8 -` を 1 回:
+
+| 項目 | 値 |
+|---|---|
+| rc / bytes | 0 / **19,801,288** |
+| 先頭 4 B | `47 40 00 10` |
+| remux4k | 0 resyncs、longest gap 340 ms recovered |
+| 取得後 | `MIXER/Sink=true`, `si=141/45170`, `discover=Ok(readers 1/2)` 維持 |
+
+**t4s-tuner 直接の tap は live を壊さない**（§9 と同じ）。
+
+### 14.2 キー経路（CH UP 0x00C）は 4K 局を選べない
+
+`uimkey 0x00C 0 0x12044` → 0.2s → `uimkey 0x00C 2 0x12044`（msg 0x12044, type0+type2）:
+
+- 送信約 80 秒後の時点で **si は 141/45170 のまま**、`discover=Ok(readers 1/2)`、
+  `MIXER/Sink=true`、`last_key` は null。**選局に至らない**。
+- （その後 si が 101/45328 等へ変化したのは、この検証と並行して別経路で
+  `send <service> 0 0`（0x6004）が実行されたためで、キー単独の効果ではない。
+  §15 で切り分け済み。）
+
+### 14.3 0x6004（`send <service> 0 0`）は 4K 切替に有効
+
+緑（`discover=Ok`）のとき `send 101 0 0` を 1 回:
+
+- si **141/45170 → 101/45328**、`discover=Ok(readers 1/2)` 維持、`MIXER/Sink=true`。
+- `t4s-tuner --type BS4K --channel 45328 --duration 8 -` → rc=0 / **13,998,480 B** /
+  先頭 16 B `47 40 00 10 00 00 b0 0d b1 10 c1 00 00 00 65 e1`
+  （TSID 0xB110=45328, program 101）。
+- ffprobe: video **hevc / Main 10 / 3840x2160 / yuv420p10le /
+  color_transfer=bt2020-10 / color_primaries=bt2020**、audio **aac_latm / 48000 / 2ch**。
+  （NHK BS4K(101) は HLG ではなく bt2020-10。§phase4-bsp4k 冒頭の局別色表と一致。）
+- 参考（別経路の記録）: mirakc API `BS4K/45328/stream?decode=1` は HTTP 200 /
+  41,091,072 B（15 s クライアント timeout）でも取得できた。
+
+### 14.4 判定
+
+- **HDMI なしでも、緑状態であれば (a) キー以外の `0x6004` 切替、(b) `t4s-tuner` 直接取得、
+  (c) mirakc API 配信、がすべて可能**。緑状態の成立条件は HDMI シンクではなく
+  「本体ボタン電源ON → 前回チャンネル復元 → 4K デコード開始」（§13.5）。
+- **キー（CH UP）では 4K 局を選べない**。
+- ただし 0x6004 と API の使い方によっては live を失う（→ §15）。
+- 検証用 TS は `.tmp/hdmi-free/{step1-45170,step2-45328}.ts` に保管（リポジトリ非追跡）。
+
+---
+
+## 15. 追記（2026-11-14 22:00–22:27 JST）: discover=Err の条件と対策
+
+目的: §13.2 で観測した「4K の live を失う（`discover=Err`, `MIXER/Sink=false`）」の
+**正確な境界条件**を、緑状態を起点に 1 条件ずつ切り分けて特定する。
+
+### 15.0 前提と用語
+
+- 用語は **「緑状態（視聴状態）」** に統一（冒頭の訂正注記）。緑 = `MIXER/Sink/buf_buf=true`
+  かつ `discover=Ok(readers≥1)`。
+- 実機は 21:52 にユーザー再起動 → bring-up 後 22:00 に緑復帰
+  （`mirakc` pid 1257, `t4s-remote` pid 1261, `si=141/45170`, `discover=Ok(1/2)`）。
+- 各手の後に必ず `t4s-probe-new discover` と `/api/status` を確認。
+
+### 15.1 各手と結果（時系列）
+
+| # | 操作 | si | discover | 判定 |
+|---|---|---|---|---|
+| 基準 | （緑、tap なし） | 141/45170 | Ok(1,2,8) | — |
+| 1.1 | `send 141 0 0`（**同一局** 0x6004 再送） | 141/45170 | **Ok(1,2,8)**（20 s 通し） | 安全 |
+| 1.2 | `send 101 0 0`（**別局・単発**、tap なし） | →101/45328 | **Ok(1,2,8)** | 安全 |
+| 1.3 | `send 151 0 0`（30 s 以上あけて別局） | →151/45168 | **Ok(1,2,8)** | 安全 |
+| 1.4a | `t4s-tuner --channel 45168 --duration 6` 直接 | 151/45168 | Ok(1,2,8)、rc=0 / 15,075,908 B | 安全 |
+| 1.4b | `send 161 0 0`（tuner tap の直後） | 151→161/45329 | **一時 Err(~4 s) → Ok(1,2,8) に回復** | 一過性 |
+| 1.4c | **mirakc API #1** `BS4K/45329/stream?decode=1` | 161/45329 | HTTP200 / 48,005,120 B、直後 **Ok** | 安全 |
+| 1.4d | **API #2, #3**（10 s あけて連続取得） | 161/45329 | → **Err**（`MIXER/Sink` は true のまま） | **破壊** |
+
+mirakc ログ（`/mnt/t4s/var/log/mirakc.log`）:
+`Streaming started channel=BS4K/45329 stream.id=0.0.1 (13:05:23)` →
+`0.1.1 (13:06:37)` → `0.2.1 (13:07:29)`。以後 `discover=Err`。
+
+### 15.2 コード経路（Step 2）
+
+- `t4s-probe-new send <sid> <mode> <nd>`（`rust/t4s-probe/src/main.rs:821`）と
+  `t4s-tuner` の `send_change`（`rust/t4s-tuner/src/main.rs:180`）は、
+  **同一の 0x6004 ボディ** `[0, oid, 9, tune, 0x0b, sid, freq, tsid, not_decode, bid]` を
+  qid **0x36F (ADSB_COMM)** へ `msgsnd` する（`tuner.rs::ChangeChannelRequest::body`）。
+  相違は `oid` のみ（probe 0x41 / tuner 0x40）。
+- `tuner.rs:1163` の警告: **「live ES ring への tap は 0x6004 の前に解放しないと、
+  製品側のバッファ teardown が `XCE_IN_USE` で失敗する」**。
+- mirakc の tuner は `t4s-tuner --duration -` を spawn し、クライアント切断で kill する。
+  → **tap の生成/解放が短時間に重なると製品側 teardown が失敗**しうる。
+
+### 15.3 結論（Err になる条件）
+
+- **仮説の棄却**: 「別サービスへの 0x6004 単発」は原因では**ない**（1.2/1.3 とも Ok 維持）。
+- **支持された仮説**: **「短間隔の連投」**。
+  - 1.1–1.3 の `send` 単発はすべて安全。1.4b でも tap 直後の単発は一過性 Err→回復。
+  - **落ちたのは mirakc API の連続取得（同一局を約 2 分で 3 回、`--duration -` の
+    spawn/kill が連続）**の後（1.4d）。
+- 機序（推定）: mirakc 由来の `t4s-tuner` tap が解放される前に次の 0x6004 / tap が
+  入ると、製品の buffer teardown が `XCE_IN_USE` で失敗 → live 喪失。
+  `discover=Err` は「**tap と 0x6004 の近接 × 繰り返し**」で発生する。
+- 補足: 一度 Err になると、たとえ `MIXER/Sink=true` が残っていても
+  **`discover` は製品が再デコードしない限り Ok に戻らない**。
+
+### 15.4 ソフトでの緑復帰 = 不可能（本体ボタンが必要）
+
+Err 状態（22:08, `MIXER/Sink=true`, `si=161/45329`, `discover=Err`）から 1 手ずつ試行:
+
+| # | 操作 | 結果 |
+|---|---|---|
+| 3a | `send 161 0 0`（SI と同局へ再送） | Err のまま 20 s → 約 2 分後さらに **MIXER/Sink=false へ悪化** |
+| 3b | `send 161 3 0`（TUNE_RESUME=製品の resume 経路） | Err のまま |
+| 3b2 | `send 141 0 0`（別局） | **si すら変化せず**（ADSB TUM が 0x6004 を処理しない） |
+| 3c | `adsbinit`（0x6001→0x6002→0x6004, 製品の初期化列） | Err のまま |
+
+- 補足: Err 化後は ADSB_COMM キュー（msqid 1605681, qid 0x36F）・Q_ADSB_TUM
+  （msqid 884763）は空（`qnum=0`）だが、**製品側 TUM 状態機械が再 tune/再デコードを行わない**。
+- **ソフトで緑に戻す手段は見つからなかった。復帰には本体ボタンでの電源ON
+  （`eSdmGetLastChInfo` → `WAIT_TUNE_LAST_CH` の前回チャンネル復元）が必要**。
+  本測定でも 21:19 / 21:52 の再起動後に緑復帰を実測している。
+
+### 15.5 推奨運用
+
+1. **緑（`discover=Ok`）のときだけ** 4K 取得/切替を行う。`discover=Err` のときは
+   **0x6004 を送らない**（3a で悪化を実測）。
+2. **mirakc API の同一局連続取得は避ける**。1 局につき 1 回、次まで **10 秒以上**あける。
+   連投（`--duration -` の spawn/kill 連続）が Err の主因。
+3. `send`（0x6004）での切替は **1 手ずつ、各後に `discover` を確認**。単発は安全。
+   直前に `t4s-tuner` / API の tap を動かさない（近接させない）。
+4. 取得前に `t4s-probe-new discover` で `readers≥1` を確認してから実行する。
+5. Err 化したら即その手を止め、**ユーザーに本体ボタンでの緑復帰を依頼**する。
+
+### 15.6 状態保全（テスト後）
+
+- mirakc pid 1257（40772）/ t4s-remote pid 1261（8484）稼働、`/mnt/t4s`（loop0）rw 維持。
+- 製品: `MIXER/Sink/buf_buf=false`, `si=161/45329`, lock=8, bank2=[0,0,8], load ~28。
+  §10 と同じ失敗状態で、緑復帰待ち（本体ボタン）。
+- 実施: bring-up 1 回 / `send` 計 6 回 / `t4s-tuner` 3 回 / API 3 回 / read-only 観測。
+  キー連打・電源操作・reboot は行っていない。
