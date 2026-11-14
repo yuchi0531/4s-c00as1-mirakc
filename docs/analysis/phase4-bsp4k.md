@@ -1235,3 +1235,96 @@ uptime 68 s）。mirakc/t4s-remote は未起動の状態で検証を実施。
 
 **結論**: remux4k teardown 修正（`a11000f`）により、4K tap を 3 回連続で開閉しても
 `os error 1038` を起こさず、緑状態を維持したまま反復取得できることを実機で確認した。
+
+---
+
+## 17. 追記（2026-11-15 00:36–00:49 JST）: mirakc API 4K 連続取得（teardown 修正後）— **不合格**
+
+目的: teardown 修正版（`t4s-tuner` md5 `93e48326…`, 566,228 B）で、mirakc API の
+**同一局 4K 連続取得**（§15.3 の Err 主因）が解消したかを検証する。
+§16.7 の「t4s-tuner 直接 3 回連続」は合格していたため、差は **mirakc 経由**
+（`--duration -` を spawn し、クライアント切断で kill する点）にあると予想した。
+
+### 17.1 前提
+
+- 実機は緑（`MIXER/Sink/buf_buf=true`, `si=141/45170`, `discover=Ok(1,2)`）。
+- mirakc pid 989 / t4s-remote pid 993。`/mnt/t4s` rw。
+- 配置済み `t4s-tuner` md5 `93e48326949601be314e1478f66e73fe`（§16.7 と同一）。
+- 手順: `curl --max-time 20 '…/api/channels/BS4K/45170/stream?decode=1'` を
+  各回の間に **10 秒以上**あけて 3 回。各回直後に `/api/status` と `discover`。
+
+### 17.2 結果
+
+| 回 | 時刻 | HTTP | bytes | 先頭 4B | 直後 MIXER/Sink | 直後 discover |
+|---:|---|---:|---:|---|---|---|
+| 1 | 00:37:10 | **200** | 66,912,256 | `47 40 00 10` | true / true | **Ok(readers 2/3)** |
+| 2 | 00:38:05 | **404** | 38 | `7b22636f`（`{"code":404…`） | true / true | **Err**（その後…） |
+| 3 | — | **未実施** | — | — | — | — |
+
+- **API #1 は成功**（200 / 66,912,256 B / 先頭 `47 40 00 10`）。
+- **API #2 は 404**（`{"code":404,"reason":null,"errors":[]}`、38 B）。mirakc の
+  `error.rs` では 404 = `TunerUnavailable` / `TunerNotFound` / `ChannelNotFound` /
+  `ServiceNotFound` のいずれか。**HTTP 200 の最初の TS パケットが来る前に失敗**した。
+- **API #2 の後、`discover=Err`** となった。**API #3 は実施せず**、以降 `send` もキーも
+  送っていない（プロトコルどおり即停止）。
+- その後 00:48 にかけて **`MIXER/Sink=false` へ悪化**（§10 の失敗状態）。4 回以上
+  ポーリングしても Err のまま（持続）。
+
+mirakc ログ（`/mnt/t4s/var/log/mirakc.log`）:
+
+```
+15:37:09 Streaming started channel=BS4K/45170 ... stream.id=0.0.1   (API#1)
+15:37:31 Streaming stopped stream.id=0.0.1
+15:38:04 Streaming started channel=BS4K/45170 ... stream.id=0.1.1   (API#2)
+15:38:14 Streaming stopped stream.id=0.1.1
+```
+
+（API#2 は tuner を起動したが、10 秒で停止 = 最初の TS パケットが来ず 404。）
+
+### 17.3 ffprobe（API #1: `.tmp/api4k/api4k-1.ts`）
+
+- container **mpegts** / duration 18.64 s / bit_rate 28.73 Mbps / sync ratio **1.0**。
+- video: **hevc / Main 10 / 3840x2160 / yuv420p10le / color_transfer=arib-std-b67 (HLG) /
+  color_primaries=bt2020**。
+- audio: **aac_latm / LC / 48000 Hz / 2ch**。
+
+API #1 自体は健全な 4K TS を返している（旧 §13.1 と同じ）。
+
+### 17.4 考察（なぜ直接取得は通り、API 連続は落ちるか）
+
+- §16.7 の直接 3 連続は、`t4s-tuner` が `--duration 10` で**自分で正常終了**し、
+  `Tap::drop`（=冪等 `close()`）→ 300 ms 待機 → プロセス終了、の順で後始末が完走した。
+- mirakc 経由は `--duration -` で**クライアント切断時に外部から kill** される。
+  mirakc は **SIGTERM → 2 秒の猶予 → SIGKILL**（`command_util.rs:51-310`,
+  `kill_on_drop(true)`）。`t4s-tuner` は SIGTERM を捕捉して `STOP` を立て
+  `pump` から抜ける設計（`main.rs:37-44, 142-143`）だが、
+  - **#1 で readers が 2/3 に増えていた**（旧 tap または ES reader が一部残った）こと、
+  - **#2 が最初の TS パケットを得られず 10 秒で停止**したこと、
+  から、**kill 経路では teardown が完走せず tap/ES reader が leak し、次の open を
+  妨げる**と推定される。§15.3 の「tap と 0x6004 / 次 tap の近接」と同じ機序。
+- したがって **remux4k teardown 修正（`a11000f`）は「正常終了」経路では有効
+  （§16.7 合格）だが、mirakc の kill 経路（SIGTERM→SIGKILL）の連続取得では不十分**。
+
+### 17.5 合格条件と判定
+
+- 合格条件: 3 回とも HTTP 200 / bytes>0 / 各回後 `discover=Ok` 維持。
+- 判定: **不合格**（API #1 のみ 200、API #2 が 404、以後 `discover=Err` → `MIXER/Sink=false`）。
+
+### 17.6 推奨運用（API 経由）
+
+1. **mirakc API の同一局 4K 連続取得は引き続き避ける**（§15.3/§15.5 と同じ）。
+   1 局につき 1 回、次まで十分な間隔（少なくともホスト tap の後始末が終わるまで）あける。
+2. 反復取得が必要なら、**直接 `t4s-tuner --duration <sec>`（正常終了）を使う**方が
+   現状は安全（§16.7 で 3 連続合格）。
+3. mirakc kill 経路（SIGTERM/SIGKILL）でも teardown を完走させるには、
+   - SIGTERM 捕捉時に DriveGraph を明示 `close()` してから exit する、
+   - もしくは mirakc 側の SIGTERM 猶予（`MIRAKC_COMMAND_PIPELINE_SIGTERM_GRACE_NANOS`）
+     を長めに取る、
+   などの追加対策が必要（**未実装・要検討**）。
+4. Err 化したら API も `send` も止め、本体ボタン（+ wedged tap 解放の再起動）で復帰。
+
+### 17.7 状態保全
+
+- mirakc pid 989 / t4s-remote pid 993 稼働。製品は `MIXER/Sink=false`, `si=141/45170`,
+  `discover=Err`（§10 失敗状態、緑復帰待ち）。
+- 実施: API #1/#2 の 2 回のみ。0x6004・キー・電源/reboot は行っていない。
