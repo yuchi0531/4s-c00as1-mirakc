@@ -23,7 +23,7 @@ use std::{
 };
 
 use t4s_core::{
-    bs2k, channels, isdbs, remux4k, si, tuner, xcdrv,
+    bs2k, channels, isdbs, remux4k, si, xcdrv,
     xcdrv::XcDrv,
     tssrc::TsSource,
 };
@@ -176,77 +176,51 @@ fn open_driver(path: &str) -> Result<Arc<XcDrv>, String> {
         .map_err(|e| format!("cannot open {path}: {e}"))
 }
 
-fn wait_for_decode_chain(drv: &Arc<XcDrv>) -> Result<(), String> {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(250));
-        let Ok(live) = remux4k::discover(drv) else {
-            continue;
-        };
-        if live.video_readers >= 1 && live.audio_readers >= 1 {
-            std::thread::sleep(Duration::from_millis(500));
-            return Ok(());
-        }
-    }
-    Err("the product did not finish rebuilding its decode chain within 10 s".into())
-}
+/// How long the 4K path waits, read-only, for the live ES pair's decoders
+/// before giving up. mirakc kills the previous session and immediately reopens,
+/// so the product may still be re-attaching its decoders.
+const LIVE_ES_WAIT: Duration = Duration::from_millis(3000);
+const LIVE_ES_POLL: Duration = Duration::from_millis(150);
+/// Bound on retrying `Tap::open` while REMUX create returns XCE_TIMEOUT (1038),
+/// i.e. while the previous teardown is still in flight.
+const TAP_OPEN_WAIT: Duration = Duration::from_millis(3000);
+const TAP_OPEN_BACKOFF: Duration = Duration::from_millis(250);
 
-fn send_change(service_id: u16, oid: u32, mode: u32) -> Result<(), String> {
-    let (tsid, freq, bid) = channels::tuning_record(service_id)
-        .ok_or_else(|| format!("service {service_id} is not in the advanced-BS table"))?;
-    let t = tuner::Tuner::open_qid(tuner::ADSB_COMM_QID, tuner::MSGH_LIST)
-        .map_err(|e| format!("tuner queue: {e}"))?;
-    t.change_channel(&tuner::ChangeChannelRequest {
-        oid,
-        tune: mode,
-        not_decode: 0,
-        service_id,
-        freq_khz: freq,
-        tlv_stream_id: tsid,
-        bid,
-    })
-    .map_err(|e| format!("change-channel request: {e}"))
-}
-
-/// Tune the product through its own channel-change message and confirm with
-/// the SI files it publishes under /tmp/adsb.  This is the firmware-independent
-/// path: it does not read fixed addresses inside `adsb`.
+/// Wait, read-only, for the product to be decoding `service_id` with both the
+/// video and audio decoders attached, then return its SI.
+///
+/// This deliberately **never sends 0x6004**: the old "discover=Err -> 0x6004"
+/// fallback is what wedged the box into `MIXER/Sink=false` when the previous
+/// session's teardown was still running (docs/analysis/phase4-bsp4k.md §15,
+/// §17). If the live service is not the requested one, or the ES pair does not
+/// come up within `LIVE_ES_WAIT`, it fails instead of tuning.
 fn tune_4k(drv: &Arc<XcDrv>, service_id: u16) -> Result<si::LiveService, String> {
-    let mut oid: u32 = 0x40;
-    let live_now = si::live_service(si::ADSB_SI_DIR);
-    if live_now.is_some_and(|l| l.service_id == service_id) && remux4k::discover(drv).is_ok() {
-        wait_for_decode_chain(drv)?;
-        return live_now.ok_or_else(|| "selection disappeared".to_string());
-    }
-
-    send_change(service_id, oid, tuner::TUNE_CHANNEL_CHANGE)?;
-    let begin = Instant::now();
-    let mut resumed = false;
-    let mut last = String::from("SI never confirmed the requested service");
-    while begin.elapsed() < Duration::from_secs(15) {
-        std::thread::sleep(Duration::from_millis(250));
+    let deadline = Instant::now() + LIVE_ES_WAIT;
+    loop {
         if let Some(live) = si::live_service(si::ADSB_SI_DIR) {
-            if live.service_id == service_id {
-                match wait_for_decode_chain(drv) {
-                    Ok(()) => {
-                        eprintln!(
-                            "t4s-tuner: confirmed service {} TLV {:#06x}",
-                            live.service_id, live.tlv_stream_id
-                        );
-                        return Ok(live);
-                    }
-                    Err(e) => last = e,
-                }
+            if live.service_id != service_id {
+                return Err(format!(
+                    "live service is {} but {} was requested; refusing to send 0x6004 for 4K",
+                    live.service_id, service_id
+                ));
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remux4k::wait_for_decoder_ready(drv, remaining, LIVE_ES_POLL).is_ok() {
+                eprintln!(
+                    "t4s-tuner: confirmed service {} TLV {:#06x}",
+                    live.service_id, live.tlv_stream_id
+                );
+                return Ok(live);
             }
         }
-        if !resumed && begin.elapsed() > Duration::from_secs(5) && remux4k::discover(drv).is_err()
-        {
-            oid += 1;
-            send_change(service_id, oid, tuner::TUNE_RESUME)?;
-            resumed = true;
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "4K ES pair not ready after {}ms; refusing to send 0x6004",
+                LIVE_ES_WAIT.as_millis()
+            ));
         }
+        std::thread::sleep(LIVE_ES_POLL);
     }
-    Err(format!("4K selection not confirmed for {service_id}: {last}"))
 }
 
 fn run_4k(args: &Args, deadline: Option<Instant>) -> Result<(), String> {
@@ -271,15 +245,11 @@ fn run_4k(args: &Args, deadline: Option<Instant>) -> Result<(), String> {
         stall_abort_ms: 5000,
         ..remux4k::TapConfig::default()
     };
-    let tap = match remux4k::Tap::open(Arc::clone(&drv), cfg) {
-        Ok(tap) => tap,
-        Err(first) => {
-            eprintln!("t4s-tuner: REMUX open failed ({first}); retrying once");
-            std::thread::sleep(Duration::from_millis(1000));
-            wait_for_decode_chain(&drv)?;
-            remux4k::Tap::open(Arc::clone(&drv), cfg).map_err(|e| format!("REMUX open: {e}"))?
-        }
-    };
+    // Retry while REMUX create returns 1038: the previous session's teardown
+    // may still be in flight when mirakc reopens us. Each failed attempt closes
+    // its own half-built graph, so nothing is stacked.
+    let tap = remux4k::Tap::open_with_retry(Arc::clone(&drv), cfg, TAP_OPEN_WAIT, TAP_OPEN_BACKOFF)
+        .map_err(|e| format!("REMUX open: {e}"))?;
     let outcome = pump(tap, deadline);
     // `pump` owns the tap, so its teardown has already run and the driver
     // fd is still open. Give the ARC a moment to finish destroying the

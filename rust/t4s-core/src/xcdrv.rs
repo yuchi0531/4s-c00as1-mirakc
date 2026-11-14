@@ -384,13 +384,29 @@ const fn remux_config_request(device: u32, stream_id: u32) -> [u32; 7] {
 /// 0x1000, 0x468000, 1, 1, 1, &tsout, "TSOUT")`, i.e. `m_bf_flags = 3`.
 ///
 /// Unlike the RING buffers used by the DEMUX path, a LINEAR_RING takes its
-/// size in bytes; 0x468000 is a compile-time immediate at `adsb:0x422ae`.
-/// Flag bit 1 is what puts the allocation inside the host-visible XCode
-/// aperture: the product's own flags=1 ES rings land below 0x1F000000 and
-/// cannot be mapped, while every flags=3 buffer in the live graph can.
+/// size in bytes; the product's 0x468000 (4.5 MiB) is a compile-time immediate
+/// at `adsb:0x422ae`. We enlarge it (see `REMUX_TSOUT_BYTES`) for the same
+/// reason the 2K DEMUX ring was enlarged: the host reader drains at roughly the
+/// 4K bit rate, so a 4.5 MiB ring fills within a few tens of milliseconds and a
+/// parked writer then answers every device-control command with XCE_TIMEOUT
+/// (os error 1038) during teardown. Flag bit 1 is what puts the allocation
+/// inside the host-visible XCode aperture: the product's own flags=1 ES rings
+/// land below 0x1F000000 and cannot be mapped, while every flags=3 buffer in
+/// the live graph can.
 const fn remux_tsout_buffer_request() -> [u32; 9] {
-    [4, 1, 0, 1, 0x1000, 0x468000, 1, 3, 0]
+    [4, 1, 0, 1, 0x1000, REMUX_TSOUT_BYTES, 1, 3, 0]
 }
+
+/// Size of the host TSOUT LINEAR_RING in bytes.
+///
+/// The product uses 0x468000 (4.5 MiB). This is enlarged to 24 MiB so the host
+/// reader has the same slack the 2K path gained from its enlarged DEMUX ring
+/// (`tsd_...`): a full ring parks the REMUX inside its write and turns every
+/// teardown ioctl into XCE_TIMEOUT (1038), which is what left half-built
+/// REMUX graphs behind for the next open (docs/analysis/phase4-bsp4k.md §16,
+/// §17). The value is our choice, not a product literal — the driver only
+/// cares that it is a page-aligned byte count the aperture can hold.
+pub const REMUX_TSOUT_BYTES: u32 = 0x0180_0000; // 24 MiB
 
 /// `adsb:0x4232c`: the metadata side channel created alongside TSOUT. The
 /// REMUX is created with `m_max_output = 2` and the product connects both
@@ -1737,11 +1753,15 @@ mod tests {
         );
         assert_eq!(std::mem::size_of_val(&remux_config_request(0, 0)), 28);
 
-        // adsb:0x422e2 TSOUT and 0x4232c TSINFO, both m_bf_flags = 3
+        // adsb:0x422e2 TSOUT and 0x4232c TSINFO, both m_bf_flags = 3.
+        // The product's TSOUT size is 0x468000 (4.5 MiB); we deliberately use
+        // a larger ring (REMUX_TSOUT_BYTES) so a parked writer cannot wedge the
+        // teardown into XCE_TIMEOUT. Everything else matches the product.
         assert_eq!(
             remux_tsout_buffer_request(),
-            [4, 1, 0, 1, 0x1000, 0x468000, 1, 3, 0]
+            [4, 1, 0, 1, 0x1000, REMUX_TSOUT_BYTES, 1, 3, 0]
         );
+        assert_ne!(REMUX_TSOUT_BYTES, 0x468000, "TSOUT ring is deliberately enlarged");
         assert_eq!(
             remux_tsinfo_buffer_request(),
             [4, 2, 0x10, 1, 0x1000, 0x20000, 1, 3, 0]

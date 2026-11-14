@@ -640,6 +640,39 @@ impl Tap {
         Ok(tap)
     }
 
+    /// Open, retrying while REMUX create returns XCE_TIMEOUT (os error 1038).
+    ///
+    /// A previous session's teardown can still be in flight when mirakc kills
+    /// and immediately reopens the 4K tuner, so create fails with 1038 for a
+    /// short window. Each `Tap::open` cleans up its own half-built graph on
+    /// failure (`close()`), so retrying never stacks remnants. `budget` bounds
+    /// the wait; on timeout the last 1038 is returned with context.
+    pub fn open_with_retry(
+        drv: Arc<XcDrv>,
+        cfg: TapConfig,
+        budget: Duration,
+        interval: Duration,
+    ) -> io::Result<Self> {
+        retry_within(
+            budget,
+            interval,
+            Instant::now,
+            std::thread::sleep,
+            is_xce_timeout,
+            || Tap::open(Arc::clone(&drv), cfg),
+        )
+        .map_err(|e| {
+            if is_xce_timeout(&e) {
+                io::Error::other(format!(
+                    "4K tap open failed after {}ms (1038); previous teardown still in flight",
+                    budget.as_millis()
+                ))
+            } else {
+                e
+            }
+        })
+    }
+
     /// `adsb`'s recording recipe with the recording removed.
     fn build(&mut self) -> io::Result<()> {
         let d = Arc::clone(&self.drv);
@@ -681,7 +714,12 @@ impl Tap {
         // A short read timeout bounds how long `pump` can notice a stop flag
         // (SIGTERM) between reads; the teardown after it must fit inside
         // mirakc's two-second SIGTERM grace. Data still returns immediately.
-        self.src = Some(XcReaderSource::adopt(Arc::clone(&d), self.tsout, reader, 100));
+        self.src = Some(XcReaderSource::adopt(
+            Arc::clone(&d),
+            self.tsout,
+            reader,
+            ES_READER_TIMEOUT_MS,
+        ));
         if self.tsinfo != 0 {
             d.set_buffer_ready(self.tsinfo)?;
             let info_reader = d.create_reader(self.tsinfo)?;
@@ -740,7 +778,7 @@ impl Tap {
         // Stop consuming and let the REMUX finish whatever it already wrote.
         // Without this the writer can stay parked in the ring while we ask
         // the driver to detach it.
-        drain(&mut self.src, Duration::from_millis(250));
+        drain(&mut self.src, DRAIN_BUDGET);
         self.src = None;
         self.info_src = None;
 
@@ -780,6 +818,36 @@ impl Tap {
                 report.describe_leaks()
             );
         }
+
+        // Give the product's decoders a moment to reclaim their ES reader slots
+        // after our graph is gone. Read-only: `discover` never sends 0x6004.
+        // If the counts never fall back, a following open can see 2/3 and its
+        // REMUX create may time out (docs/analysis/phase4-bsp4k.md §18).
+        settle_after_close(&self.drv, self.live);
+    }
+}
+
+/// Wait, read-only, for the product's ES reader counts to return to the
+/// baseline recorded at `open`. Logs a warning if they do not within
+/// `CLOSE_SETTLE_BUDGET`.
+fn settle_after_close(drv: &Arc<XcDrv>, baseline: LiveEs) {
+    let deadline = Instant::now() + CLOSE_SETTLE_BUDGET;
+    loop {
+        if let Ok(es) = discover(drv) {
+            if es.video_readers <= baseline.video_readers
+                && es.audio_readers <= baseline.audio_readers
+            {
+                return;
+            }
+        }
+        if Instant::now() >= deadline {
+            eprintln!(
+                "remux4k: readers did not settle to {}/{} after close",
+                baseline.video_readers, baseline.audio_readers
+            );
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(100));
     }
 }
 
@@ -900,6 +968,82 @@ fn timeout_noise(e: &io::Error) -> bool {
     matches!(e.raw_os_error(), Some(1038 | 1039))
 }
 
+/// The driver's XCE_TIMEOUT (os error 1038). REMUX create returns it while the
+/// ARC is still releasing a previous graph, which is exactly what happens when
+/// mirakc kills and immediately reopens the 4K tuner (docs/analysis/phase4-bsp4k.md
+/// §17, §18). Narrower than `timeout_noise`: only a timeout is worth retrying a
+/// whole `Tap::open` for.
+pub fn is_xce_timeout(e: &io::Error) -> bool {
+    e.raw_os_error() == Some(1038)
+}
+
+/// Run `attempt`, retrying while `should_retry` accepts the error, until
+/// `budget` has elapsed. `now` and `sleep` are injected so the loop is unit
+/// tested without real time. Returns the last error on timeout.
+fn retry_within<T>(
+    budget: Duration,
+    interval: Duration,
+    mut now: impl FnMut() -> Instant,
+    mut sleep: impl FnMut(Duration),
+    mut should_retry: impl FnMut(&io::Error) -> bool,
+    mut attempt: impl FnMut() -> io::Result<T>,
+) -> io::Result<T> {
+    let start = now();
+    loop {
+        match attempt() {
+            Ok(value) => return Ok(value),
+            Err(e) => {
+                if !should_retry(&e) || now().duration_since(start) >= budget {
+                    return Err(e);
+                }
+                sleep(interval);
+            }
+        }
+    }
+}
+
+/// Read-only readiness gate before building our REMUX.
+///
+/// mirakc kills the previous session (SIGTERM) and immediately opens the next,
+/// so the product may still be re-attaching its decoders when we look. Poll
+/// `discover` until the live ES pair has both decoder readers, or `budget`
+/// elapses. **Never sends 0x6004**: that channel change is what wedged the box
+/// in §15, and refusing it here is the whole point of this gate.
+pub fn wait_for_decoder_ready(
+    drv: &Arc<XcDrv>,
+    budget: Duration,
+    interval: Duration,
+) -> io::Result<LiveEs> {
+    let mut last = String::from("discover has not run yet");
+    retry_within(
+        budget,
+        interval,
+        Instant::now,
+        std::thread::sleep,
+        |_| true, // every "not ready" result is retryable; nothing is sent
+        || match discover(drv) {
+            Ok(es) if es.video_readers >= 1 && es.audio_readers >= 1 => Ok(es),
+            Ok(es) => {
+                last = format!(
+                    "live ES pair present but readers {}/{}",
+                    es.video_readers, es.audio_readers
+                );
+                Err(io::Error::other(last.clone()))
+            }
+            Err(e) => {
+                last = e;
+                Err(io::Error::other(last.clone()))
+            }
+        },
+    )
+    .map_err(|_| {
+        io::Error::other(format!(
+            "4K ES pair not ready after {}ms; refusing to send 0x6004 ({last})",
+            budget.as_millis()
+        ))
+    })
+}
+
 /// Wall-clock budget for a whole teardown.
 ///
 /// mirakc runs the 4K tuner with `--duration -` and, when the client
@@ -909,11 +1053,35 @@ fn timeout_noise(e: &io::Error) -> bool {
 /// REMUX device keeps the live ES readers attached, so the next open fails
 /// (the observed `readers 1/2 -> 2/3` then 404). Every step below is bounded so
 /// the total stays well inside the grace.
-pub const TEARDOWN_BUDGET: Duration = Duration::from_millis(700);
+///
+/// The whole budget is: an in-flight read (`ES_READER_TIMEOUT_MS`), the initial
+/// drain (`DRAIN_BUDGET`), this, and the post-close settle wait
+/// (`CLOSE_SETTLE_BUDGET`). See `budget_fits_the_sigterm_grace`.
+pub const TEARDOWN_BUDGET: Duration = Duration::from_millis(400);
 
 /// Per-device-control timeout during teardown. Shorter than the budget so a
 /// single parked command (XCE_TIMEOUT, os error 1038) cannot consume it all.
 pub const TEARDOWN_OP_TIMEOUT_MS: u32 = 200;
+
+/// Read timeout on the TSOUT reader. A signal arriving while this reader is
+/// blocked is only noticed after one timeout, so it must be short.
+pub const ES_READER_TIMEOUT_MS: u32 = 100;
+
+/// Drain budget before detaching the graph.
+pub const DRAIN_BUDGET: Duration = Duration::from_millis(250);
+
+/// After the graph is closed, wait this long for the product's ES reader
+/// counts to fall back to their pre-tap baseline. If the previous session's
+/// readers never detach, the next open sees 2/3 and its REMUX create can time
+/// out. Read-only; never sends 0x6004.
+pub const CLOSE_SETTLE_BUDGET: Duration = Duration::from_millis(1000);
+
+/// Total worst-case close path, relative to the two-second SIGTERM grace.
+pub const fn worst_case_close_ms() -> u64 {
+    ES_READER_TIMEOUT_MS as u64 + 5 + DRAIN_BUDGET.as_millis() as u64
+        + TEARDOWN_BUDGET.as_millis() as u64
+        + CLOSE_SETTLE_BUDGET.as_millis() as u64
+}
 
 /// Retry an idempotent cleanup op while it reports benign timeout noise, but
 /// never past the shared `deadline`: mirakc may SIGKILL the tuner two seconds
@@ -1476,18 +1644,105 @@ mod close_tests {
 
     /// mirakc sends SIGTERM then SIGKILL two seconds later, so the whole graph
     /// close must finish inside that grace or the tuner is killed with the
-    /// live ES readers still attached (the §17 API failure). The budget plus
-    /// the per-op timeout are the bound that keeps it inside.
+    /// live ES readers still attached (the §17 API failure). The read timeout,
+    /// drain, teardown budget and settle wait must sum inside it.
     #[test]
     fn teardown_budget_and_op_timeout_stay_inside_the_sigterm_grace() {
-        const SIGTERM_GRACE: Duration = Duration::from_secs(2);
+        const SIGTERM_GRACE_MS: u64 = 2000;
         assert!(
-            TEARDOWN_BUDGET < SIGTERM_GRACE,
-            "TEARDOWN_BUDGET {TEARDOWN_BUDGET:?} must be under the SIGTERM grace {SIGTERM_GRACE:?}"
+            worst_case_close_ms() < SIGTERM_GRACE_MS,
+            "worst-case close {} ms must be under the SIGTERM grace {} ms",
+            worst_case_close_ms(),
+            SIGTERM_GRACE_MS
         );
         assert!(
             Duration::from_millis(u64::from(TEARDOWN_OP_TIMEOUT_MS)) < TEARDOWN_BUDGET,
             "a single op timeout must fit inside the whole-teardown budget"
         );
+    }
+
+    #[test]
+    fn retry_within_returns_immediately_on_success() {
+        use std::cell::Cell;
+        let attempts = Cell::new(0);
+        let clock = Cell::new(0u64);
+        let result: io::Result<u32> = retry_within(
+            Duration::from_millis(1000),
+            Duration::from_millis(100),
+            || Instant::now() + Duration::from_millis(clock.get()),
+            |_| {},
+            |_| true,
+            || {
+                attempts.set(attempts.get() + 1);
+                clock.set(clock.get() + 100);
+                Ok(7)
+            },
+        );
+        assert_eq!(result.unwrap(), 7);
+        assert_eq!(attempts.get(), 1, "success must not be retried");
+    }
+
+    #[test]
+    fn retry_within_succeeds_after_a_few_retryable_failures() {
+        use std::cell::Cell;
+        let attempts = Cell::new(0);
+        let clock = Cell::new(0u64);
+        let result: io::Result<u32> = retry_within(
+            Duration::from_millis(1000),
+            Duration::from_millis(100),
+            || Instant::now() + Duration::from_millis(clock.get()),
+            |d| clock.set(clock.get() + d.as_millis() as u64),
+            is_xce_timeout,
+            || {
+                attempts.set(attempts.get() + 1);
+                if attempts.get() < 3 {
+                    Err(io::Error::from_raw_os_error(1038))
+                } else {
+                    Ok(42)
+                }
+            },
+        );
+        assert_eq!(result.unwrap(), 42);
+        assert_eq!(attempts.get(), 3);
+    }
+
+    #[test]
+    fn retry_within_gives_up_at_the_budget() {
+        use std::cell::Cell;
+        let attempts = Cell::new(0);
+        let clock = Cell::new(0u64);
+        let result: io::Result<u32> = retry_within(
+            Duration::from_millis(300),
+            Duration::from_millis(100),
+            || Instant::now() + Duration::from_millis(clock.get()),
+            |d| clock.set(clock.get() + d.as_millis() as u64),
+            is_xce_timeout,
+            || {
+                attempts.set(attempts.get() + 1);
+                Err(io::Error::from_raw_os_error(1038))
+            },
+        );
+        assert_eq!(result.unwrap_err().raw_os_error(), Some(1038));
+        let n = attempts.get();
+        assert!((3..=4).contains(&n), "bounded attempts, got {n}");
+    }
+
+    #[test]
+    fn retry_within_does_not_retry_a_non_timeout_error() {
+        use std::cell::Cell;
+        let attempts = Cell::new(0);
+        let result: io::Result<u32> = retry_within(
+            Duration::from_millis(1000),
+            Duration::from_millis(100),
+            Instant::now,
+            |_| {},
+            is_xce_timeout,
+            || {
+                attempts.set(attempts.get() + 1);
+                Err(io::Error::from_raw_os_error(5)) // EIO: not retryable
+            },
+        );
+        assert_eq!(result.unwrap_err().raw_os_error(), Some(5));
+        assert_eq!(attempts.get(), 1);
     }
 }

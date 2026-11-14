@@ -1473,3 +1473,123 @@ MIXER/Sink=false に降下。**プロトコルどおり即停止**（send/キー
 - mirakc ログには t4s-tuner の stderr（`remux4k:` / `1038`）が残っていない
   （現行ログレベル）。**teardown leak の有無は mirakc ログからは確認できない**。
   次回は `RUST_LOG` を上げるか、t4s-tuner の stderr をファイルへ回す。
+
+---
+
+## 19. 追記（2026-11-15）: API 408 対策（discover リトライ / open リトライ / TSOUT ring 拡大 / close 後 settle 待ち）— コード実装（実機未検証）
+
+§18.5 で、SIGTERM 明示 close（`c64ab6c`）後も API 連続取得が非決定（試行1: 3/3、
+試行2: 3 回目が **408**）であることを確認した。各取得直後の readers が
+**2/3 → 0/0 → 1/2** と遷移する事実から、**前の teardown が終わる前に次の open が走る**
+競合が主因と推定。これに対する 4 つの対策を実装した。**本節はホスト側の実装・
+ユニットテストのみ。実機検証は §19.7 の手順を緑復帰後に行う（未実施）。**
+
+### 19.1 対策1: `Tap::open` の 1038 リトライ（本命）
+
+- `remux4k::Tap::open_with_retry(drv, cfg, budget, interval)` を追加。`Tap::open` が
+  **os error 1038（XCE_TIMEOUT）** で失敗したら、`budget` まで `interval` バックオフで
+  再試行する。
+- 各 `Tap::open` は失敗時に**自分の半端な graph を `close()` で掃除**する（既存動作）。
+  よって再試行は残骸を積み上げず、毎回新しい handle で open する。
+- タイムアウト時は `4K tap open failed after {budget}ms (1038); previous teardown still
+  in flight` を返す。**0x6004 は一切送らない。**
+- `t4s-tuner` の `run_4k` は旧来の「open 失敗 → 1000ms 待って 1 回再試行
+  （`wait_for_decode_chain` 経由）」を廃し、`TAP_OPEN_WAIT = 3000ms` /
+  `TAP_OPEN_BACKOFF = 250ms` の `open_with_retry` に置換。
+
+### 19.2 対策2: 再 open 前の discover リトライ（read-only）
+
+- `remux4k::wait_for_decoder_ready(drv, budget, interval)` を追加。`discover` が
+  Ok でも `video_readers < 1` または `audio_readers < 1` なら `budget` まで再確認する。
+  **read-only のみ。0x6004 は送らない。**
+- `t4s-tuner` の `tune_4k` を全面改訂:
+  - **「discover=Err なら 0x6004」フォールバックを撤去**（これが §15/§17 の Err 悪化の
+    原因）。`send_change` は呼ばない。
+  - live SI が要求 service と一致する場合のみ、`LIVE_ES_WAIT = 3000ms` まで
+    read-only で `wait_for_decoder_ready` をリトライ。
+  - live SI が別 service なら
+    `live service is X but Y was requested; refusing to send 0x6004 for 4K` で失敗。
+  - タイムアウト時は `4K ES pair not ready after 3000ms; refusing to send 0x6004`。
+- 未使用になった `wait_for_decode_chain` / `send_change` を削除。
+
+### 19.3 対策3: TSOUT ring の拡大（2K と同様の考え方）
+
+- `xcdrv::REMUX_TSOUT_BYTES = 0x0180_0000`（**24 MiB**）を追加し、
+  `remux_tsout_buffer_request` の size を製品リテラル `0x468000`（4.5 MiB）から
+  これに変更。
+- 理由: 4K のホスト読み出しが実ビットレートに近く、4.5 MiB ring は数十 ms で満杯に
+  なる。満杯だと REMUX が write で parked し、teardown の全 device-control が
+  `XCE_TIMEOUT(1038)` になる（§16.1 の機序）。2K で DEMUX ring を拡大して同問題を
+  解消したのと同じ発想。
+- **サイズは本実装の選択であり製品リテラルではない（推測を含む）**。ドライバは
+  ページ整合のバイト数であれば良く、24 MiB は製品 4.5 MiB の約 5.3 倍。メモリ制約:
+  この box は `mem=666M`。TSOUT はホスト可視 aperture（flags=3）に載るため、
+  24 MiB の追加確保が製品デコードや他 buffer を圧迫しないかは**実機で要確認**。
+- テスト `product_remux_construction_is_byte_exact` を更新し、`REMUX_TSOUT_BYTES !=
+  0x468000`（意図的な拡大）と他フィールドの一致を assert。
+
+### 19.4 対策4: close 後の settle 待ち
+
+- `Tap::close` の末尾で `settle_after_close(drv, baseline)` を呼ぶ。`CLOSE_SETTLE_BUDGET
+  = 1000ms` の間、read-only で `discover` を読み、**readers が open 時の baseline
+  （例 1/2）以下に戻る**まで 100 ms 間隔で待つ。戻らなければ
+  `remux4k: readers did not settle to 1/2 after close` を警告。**0x6004 は送らない。**
+- 冪等 close は維持（`closed` フラグ、`close_graph` の handle 段階クリア）。
+
+### 19.5 タイムアウト合計（2 秒の猶予内）
+
+`worst_case_close_ms()` = reader timeout 100 + 5 + drain 250 + `TEARDOWN_BUDGET` 400
++ `CLOSE_SETTLE_BUDGET` 1000 = **1755 ms < 2000 ms**。定数 `worst_case_close_ms` と
+テスト `teardown_budget_and_op_timeout_stay_inside_the_sigterm_grace` で 2 秒未満を
+保証する。（`Tap::open_with_retry` / `wait_for_decoder_ready` の待機は **open 前**で
+あり、SIGTERM 猶予とは独立。）
+
+### 19.6 テスト（ホスト側で実施済み）
+
+- `t4s-core`: **155 passed / 0 failed**（§18 の 151 から +4）。
+  - `retry_within_returns_immediately_on_success`
+  - `retry_within_succeeds_after_a_few_retryable_failures`（1038 を 2 回 → 3 回目で成功）
+  - `retry_within_gives_up_at_the_budget`（budget 到達で打ち切り）
+  - `retry_within_does_not_retry_a_non_timeout_error`（EIO は再試行しない）
+  - `teardown_budget_and_op_timeout_stay_inside_the_sigterm_grace`（更新）
+  - `product_remux_construction_is_byte_exact`（ring サイズ更新）
+  - 既存の冪等 close・順序・1038 benign・hard leak テストは維持。
+- `t4s-tuner`: **3 passed / 0 failed**（pump 停止フラグ / duration / `--duration -`）。
+- `cargo check --workspace --release --target armv7-unknown-linux-musleabihf` → 成功
+  （警告なし）。
+- ビルド: `cargo +1.99.0 build --release --target armv7-unknown-linux-musleabihf
+  -p t4s-tuner` → 成功 / md5 `82f6b2b183bf3b48eb70bd8ff4e284a6` / 567,540 B。
+
+### 19.7 実機検証手順（未実施）
+
+前提: 本体ボタン＋再起動で緑復帰（`MIXER/Sink=true`, `discover=Ok(1,2)`）。
+配置: 新 `t4s-tuner`（md5 `82f6b2b1…`）を `/mnt/t4s/opt/t4s/bin/t4s-tuner` へ
+（旧版を退避）。`RUST_LOG` を上げるか stderr をファイルへ回して teardown ログを採取。
+
+1. 緑確認: `t4s-probe-new discover` → `Ok(video_readers 1, audio_readers 2)`。
+2. mirakc 起動（`sh /media/usb/ondevice-up.sh`）。`/api/status` で MIXER/Sink=true。
+3. API を **10 秒間隔で 5 回**:
+   ```sh
+   for i in 1 2 3 4 5; do
+     curl -sS --max-time 20 -o /tmp/api4k-$i.ts \
+       -w "run $i code=%{http_code} bytes=%{size_download}\n" \
+       'http://127.0.0.1:40772/api/channels/BS4K/45170/stream?decode=1'
+     t4s-probe-new discover
+     sleep 10
+   done
+   ```
+4. 合格条件:
+   - 5 回とも HTTP **200** / bytes > 0。
+   - 各回後の `discover` が **Ok(readers 1/2)**（readers が増えたまま定着しない）。
+   - 5 回目後も `MIXER/Sink=true`。
+   - stderr に `os error 1038` / `teardown could not release` /
+     `readers did not settle` が出ない。
+5. 不合格なら即停止し `/tmp/api4k-*.ts`、`discover`、mirakc ログ、tuner stderr を保存。
+
+### 19.8 残課題
+
+- 実機検証は **未実施**（緑復帰待ち）。
+- TSOUT ring 24 MiB の実機影響（メモリ制約 `mem=666M`、製品デコードへの影響）は
+  **未確認**。問題があれば 0x01200000（18 MiB）等へ調整。
+- `open_with_retry` / `wait_for_decoder_ready` の待機合計は最大 ~6 秒。クライアントの
+  タイムアウト（20 秒）には収まるが、初回フレームまでの遅延が伸びる可能性がある。
