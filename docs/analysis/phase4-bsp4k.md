@@ -628,3 +628,236 @@ HDMI_SYS 群の内部名）。
 
 実機はオフラインのまま。ホスト上で完結し、`t4s-probe` のビルドのみ実施。
 `.tmp/http/t4s-probe` を更新（実機未配置）。mirakc・電源操作・実機アクセスは無し。
+
+---
+
+## 13. 追記（2026-11-14 20:26–21:0x JST）: 青状態 live 中の mirakc API 4K 取得と、本体ボタン経路の read-only 調査
+
+対象: SHARP 4S-C00AS1（ViXS XCode6, ARMv7, Linux 3.10.24）。
+この時点で実機は **ユーザーが本体ボタンで電源ON**（boot 20:26 JST, uptime 535s）し、
+**製品が 4K(141/45170) を実デコード中の青状態**だった（`si=Some(141/45170)`,
+`discover=Ok(readers 1/2)`, `MIXER/Sink/buf_buf=true`）。HDMI は物理的に不在。
+制約: キー送信・電源操作・reboot は行っていない。mirakc の起動は行った。
+
+### 13.0 前準備
+
+- mirakc は停止していた（40772 closed）。pidfile `/mnt/t4s/run/mirakc.pid` は **884** だが、
+  `/proc/884/comm = kworker/0:1` の **stale pidfile**（mirakc ではない）。`t4s-remote` も停止。
+- `rm -f /mnt/t4s/run/mirakc.pid` → `sh /media/usb/ondevice-up.sh` で起動。
+  mirakc **pid 959**、`t4s-remote` pid 918（8484）。
+- `/api/version` = `{"current":"4.0.0-dev.0","latest":"4.0.0-dev.0"}`。
+- `/api/tuners` = `[{...,"types":["BS","CS","BS4K"],"isAvailable":true,"isFree":true,"isFault":false}]`。
+- 起動直後 `/api/status`（t4s-remote, 8484）:
+  `threads={MIXER:true,Sink:true,buf_buf:true,HevcFactory:true}`,
+  `si={ok:true,tlv_stream_id:45170,original_network_id:11,service_id:141}`,
+  `regs={ok:true,lock:8,bank2_selection:[0,0,8]}`, `q_uim={msqid:98307,lspid:279,lrpid:279}`。
+- `t4s-probe discover` = `Ok(LiveEs{mmt_demux:8, video_readers:1, audio_readers:2})`。
+- 設定確認（`/mnt/t4s/opt/t4s/config.yml`）: BS4K チャンネル 6 局、
+  `tuners[].command = t4s-tuner --type {{{channel_type}}} --channel {{{channel}}} --duration {{{duration}}} -`,
+  `tlv-decoder: cat -`、`decode-filter: t4s-cas --type {{{channel_type}}} --channel {{{channel}}}`。
+  BS4K は REMUX で MPEG-TS を出すため `tlv-decoder: cat -`、`t4s-cas` は素通し。
+
+### 13.1 Part A: mirakc API による 4K 取得（1回目 = 成功）
+
+```
+GET /api/channels/BS4K/45170/stream?decode=1   (curl --max-time 30)
+```
+
+| 項目 | 値 |
+|---|---|
+| HTTP | **200** |
+| bytes | **104,529,920**（30 s でクライアント側タイムアウト。ストリームは自然終了しない） |
+| 先頭 16 bytes | `47 40 00 10 00 00 b0 0d b0 72 c1 00 00 00 8d e1` |
+| 先頭 4 bytes | `47 40 00 10`（MPEG-TS sync 0x47、program 141 の PAT/PMT は §9.2 と同じ配置） |
+| ffprobe | container `mpegts` / duration 10.827 s / bit_rate 29.55 Mbps |
+
+ffprobe ストリーム:
+
+- video: **hevc / Main 10 / 3840x2160 / yuv420p10le / color_transfer=arib-std-b67 (HLG) /
+  color_primaries=bt2020**
+- audio: **aac_latm / LC / 48000 Hz / 2ch**
+- program: `program_id=141`
+
+取得直後の確認:
+
+- `/api/status`: `MIXER/Sink/buf_buf=true` のまま、`si=141/45170`、`lock=8`（**製品の 4K 視聴は
+  この時点では継続**）。
+- ただし `t4s-probe discover` は **Err**（`no live 4K ES pair found ...`）に変化
+  （取得前は `Ok(readers 1/2)`）。→ 取得（またはその停止処理）の前後で
+  **製品デコーダの ES ring reader が 0 になった**。
+
+### 13.2 Part A: 2回目（連続取得の確認）= 408 と製品デコード停止
+
+1回目の 10 秒後に同 API を再実行:
+
+```
+GET /api/channels/BS4K/45170/stream?decode=1   (curl --max-time 20)
+→ HTTP 408 / 38 bytes / body = {"code":408,"reason":null,"errors":[]}
+```
+
+mirakc ログ（`/mnt/t4s/var/log/mirakc.log`）:
+
+```
+11:37:11 INFO Streaming started channel=BS4K/45170 ... stream.id=0.0.1
+11:37:43 INFO Streaming stopped stream.id=0.0.1
+11:38:35 INFO Streaming started channel=BS4K/45170 ... stream.id=0.1.1
+11:38:54 INFO Streaming stopped stream.id=0.1.1
+```
+
+2回目（11:38:35）は tuner が起動したが **最初の TS パケットが来ず**、mirakc は 408 を返した。
+
+**この直後、製品のデコードチェーンが停止した**:
+
+| 時刻 | MIXER | Sink | buf_buf | si | lock |
+|---|---|---|---|---|---|
+| 取得前 | true | true | true | 141/45170 | 8 |
+| 1回目後 | true | true | true | 141/45170 | 8 |
+| 2回目後〜5分以上 | **false** | **false** | **false** | 141/45170 | 8 |
+
+`t4s-probe discover` は **Err**、`devices count=12`、IRQ33 (`xcfb interrupt`) は ~120/s で
+進行（OSD scanout は生存）。`/api/tuners` は `isFree=true`。**B 以降 5 分以上この状態が継続**。
+
+### 13.3 失敗の機序（推定・コード根拠あり）
+
+mirakc の tuner パイプラインは `t4s-tuner --type BS4K --channel 45170 --duration -` を spawn する。
+`rust/t4s-tuner/src/main.rs` の `tune_4k`（`main.rs:204`）は:
+
+```rust
+let live_now = si::live_service(...);
+if live_now.is_some_and(|l| l.service_id == service_id) && remux4k::discover(drv).is_ok() {
+    wait_for_decode_chain(drv)?;   // 0x6004 を送らず live を再利用
+    return ...;
+}
+send_change(service_id, 0x40, tuner::TUNE_CHANNEL_CHANGE)?;   // ← 0x6004 を送る
+```
+
+- **1回目**は `live_now=141` かつ `discover=Ok` だったので **0x6004 を送らず** REMUX tap だけを
+  張り、§9 と同じ「live 共有取得」で 200 が返った。
+- **2回目**は実行時点で `discover` が既に **Err**（reader 0）だったため、条件が成立せず
+  **`send_change`（`ADR_COMM_QID` への `0x6004`、`mode=TUNE_CHANNEL_CHANGE`）を送った**。
+  これは §10 で観測した「HDMI 無しで 0x6004 を送ると SI のみ復元し MIXER/Sink は true に
+  ならない」経路そのもの。結果、製品は SI=141/45170 を保持したまま **デコードを再開せず**
+  MIXER/Sink=false に落ちた。
+- したがって **2回目の 408 とデコード停止の直接原因は、mirakc 経由の `t4s-tuner` が
+  discover=Err のため自動的に 0x6004 を送ったこと**（禁止されている経路を、mirakc の
+  tuner コマンドが内部で踏んだ）。
+
+**未確定**: 1回目の取得自体が製品デコーダの reader を外したかどうか。§9 では直接
+`t4s-tuner --type BS4K` を 2 回連続実行しても readers 1/2 が維持された。今回の差
+（mirakc が `--duration -` で spawn し kill する点、パイプ構成）は未検証。
+「API 取得 1 回で discover が Err になった」という観測事実のみ確実。
+
+### 13.4 XCFB read-only プローブ（HDMI 不在の直接確認）
+
+`t4s-probe-new`（xcfb 入り、sha256 `24bb7600…c32a`）で read-only 実行
+（`t4s-probe` 本体 sha256 は `83ce8753…f38d` で xcfb 無し。新プローブは `t4s-probe-new` として配置済み）:
+
+```
+xcfb ioctl=0x61000 dev=/dev/xcfb_disp
+lock token=<取得>
+plug_state combined=0x0 (0x523=0x0 bit0=HPD, 0x524=0x0 bit1=RSEN)
+read_reg addr=0x3004 value=0x00000001
+read_reg addr=0x3000 value=0x000000ce
+read_reg addr=0x3020 value=0x00000020
+read_reg addr=0x3006 value=0x000000e1
+edid_block_count=0
+edid: no blocks (sink absent or EDID not readable)
+unlock ok
+```
+
+→ **HPD=0 / RSEN=0 / EDID block 数 0**。§12.1 の予測どおり。**HDMI シンクは物理的に不在**。
+それでも §13.0 の青状態（本体ボタン ON）では 4K が live だった。
+（write 系 ioctl は送っていない。read のみ。）
+
+### 13.5 Part B: 本体ボタン経路の read-only 所見
+
+キー送信・電源操作は一切行っていない。観測は `/proc`、文字列、`bdh_out_msgh.lst` のみ。
+
+#### 13.5.1 前面パネルの queue/msgId（既知の再確認）
+
+`/tmp/bdh_out_msgh.lst`（qid→msqid 対応、実機 read-only）:
+
+- `127-98307` = **Q_UIM(0x7F)**
+- `123-10748232` = **Q_FPM(0x7B)**
+
+`/proc/sysvipc/msg` で両キューとも **`lspid=lrpid=279`（abs）/ `qnum=0`**。
+abs は `T_FPM`(tid 392), `T_FPD`(315), `T_FPD3`(363), `T_FPM_DISP`(639),
+`T_UIM`(473), `T_UIM1/2/3`, `T_UIM_THUMB` を保持しており、FPM/FPD タスクは稼働中。
+（§1/§phase3 の「FPM → Q_UIM 0x12044 → UIM」経路と一致。）
+
+#### 13.5.2 abs 内の前面パネル/電源/LED 文字列（新規抽出）
+
+`.tmp/oem/abs` の文字列から、本体ボタン＝前面マイコン（FPD/FPM）系の起動・電源シーケンス:
+
+- **電源ON メッセージ**: `msgIniRequestFpmPowerOnOStart`, `msgIniRequestFpmPowerOnQStart`
+  （O=通常開始, Q=QuickStart 開始）。
+- **QuickStart 判定**: `QuickStartON` / `QuickStartOFF`,
+  `[FPM] Fpm_IsQsRestartFromPoff : TRUE/FALSE`。
+- **前面マイコン再起動種別**: `FPD_RESTART_NORMAL` / `FPD_RESTART_QSTART`
+  （`FPD : Write Restart Data FPD_RESTART_*`）。
+- **電源キー**: `FPM : eFpmPowerOffKey() msgFpmRequestUimRestartParticular RC_POWER` /
+  `RC_POW_ON`。`[IpControl] Power Key Not Send to FPM`（IP Control 由来の電源キーは FPM へ
+  送らない分岐）。
+- **起動理由**: `STARTREASON_NORMAL` / `_TV_VIEW` / `_EXTERNAL` / `_QUICK` / `_FIRST` /
+  `_EPG_*` / `_FACTORY` / `_FLASHCLEAR` / `_DOWNLOAD` / `_PCCARD` / `_TIMEGET` / `_UNDEF`、
+  `[FPM] Clear AC Recovery mode by ChangeStartReason.`,
+  `FPM : Reserve End.  Change StartReason -> NORMAL`。
+- **LED**: LED 制御は FPM ではなく表示サブタスク **`T_FPM_DISP`(0x639)** 側。
+  `[FPMD DBG] msgUimRequestFpmLedEnable Send.` / `msgUimRequestFpmLedDisable Send.`,
+  `[FPMD] SND_LED_ANS Timeout!`（LED は UIM→FPM_DISP のメッセージで enable/disable）。
+
+#### 13.5.3 電源ON 時の「前回視聴チャンネル復元」
+
+- tune ステートマシンに **`WAIT_TUNE_LAST_CH`** 状態が存在する
+  （`WAIT_TUNE_DEFAULT_CH` / `WAIT_TUNE_CHANGE_CH` / `WAIT_TUNE_RETURN_CH` 等と同じ enum 群）。
+- チャンネル情報の保存/復元は **SDA/SDM**:
+  `eSdmSetLastChInfo` / `eSdmGetLastChInfo`,
+  `[eSdaGetLastChInfo]: NETWORK_TYPE_CS2 -> NETWORK_TYPE_CS1`（保存値の正規化）,
+  `fLastChannelInvalid`（無効フラグ）, `[LastChannel]EXTENT5`。
+- 起動時の復元系: `eDBRListRestore`, `BUP_API_IsNeedRestore`, `## bVOBURestore TRUE 3`。
+- 推定（文字列＋§10 の実測から）: **本体ボタンの電源ON は `msgIniRequestFpmPowerOnOStart`
+  または `...QStart` で始まり、起動理由に応じて `eSdmGetLastChInfo` →
+  `WAIT_TUNE_LAST_CH` により前回視聴チャンネル（= 直前に見ていた 4K 141/45170）を復元し、
+  デコードを開始する**。これが「本体ボタンで青（4K 視聴）に入れる」経路。
+- 一方、§10 の **ソフトリブート（`reboot`）は `FPD_RESTART_NORMAL` / `eFpdRestart` 系の
+  別経路**を通り、上記の「電源ON＝前回チャンネル復元」を再実行しないため `si=None` の
+  ままになる、という §10 との差を説明できる。
+- **未確定**: 実際のボタン押下でどの msgId が発行されるか、`bAdsbInitialized` の現在値、
+  `eSdmGetLastChInfo` が返す保存値。今回はキー送信・pagemap 読みを行っていないため未確認。
+
+#### 13.5.4 まとめ（Part B）
+
+- 本体ボタン経路は **前面マイコン（FPD/FPM, Q_FPM=0x7B）→ UIM（Q_UIM=0x7F）** で、
+ キー入力は `abs` の FPM/FPD タスクが処理する。本 boot でも FPM/FPD タスクは稼働。
+- 「青（4K 視聴）」に入る条件は **電源ON（本体ボタン）時の通常/Quick 起動と、
+  前回視聴チャンネル（SDA/SDM 保存）の復元 → tune (`WAIT_TUNE_LAST_CH`)**。
+  これは HDMI シンク有無とは独立（§13.4 で HPD=0/EDID=0 を確認）。
+- ソフトリブートが 4K 復帰しない §10 の挙動は、起動種別（FPD_RESTART_NORMAL/
+  QSTART）と AC 復帰/起動理由の差で説明できる（推定）。
+- LED（青/緑）は `T_FPM_DISP` の `msgUimRequestFpmLedEnable/Disable` 系で制御される。
+
+### 13.6 状態保全（テスト後）
+
+- mirakc: **pid 959** 稼働（`/mnt/t4s/run/mirakc.pid`=959、40772 listen）。
+  `t4s-remote`: pid 918（8484）。`/mnt/t4s`（loop0）rw マウント維持。
+- 製品: `MIXER/Sink/buf_buf=false`、`si=141/45170`（SI は保持）、`lock=8`,
+  `bank2_selection=[0,0,8]`, `devices count=12`, load ~30。
+  **§10 と同じ「SI は残るがデコードが再開しない」失敗状態**で、5 分以上復帰せず。
+  復帰には本体ボタン（電源再投入）または通常の選局操作が必要。
+- キー送信・電源操作・reboot は行っていない。mirakc の再起動は 1 回（起動のみ）。
+- 実施したのは: mirakc 起動 / API 4K 取得 2 回 / read-only 観測 / xcfb read-only プローブ。
+
+### 13.7 結論
+
+1. **青状態（本体ボタン電源ON）で製品が 4K を実デコードしていれば、HDMI なしでも
+   mirakc API `BS4K/45170/stream?decode=1` は HTTP 200 で HEVC Main10 4K HLG + AAC-LATM の
+   TS を配信できる**（1回目: 104,529,920 bytes / 30 s）。
+2. **HDMI は完全に不在**（xcfb ioctl 0x61000 の read-only で HPD=0, RSEN=0,
+   edid_block_count=0）。§9.4 の「シンク有無を確定できない」は本測定で **シンク無しに確定**。
+3. **連続取得（2回目）は失敗（408）し、その過程で `t4s-tuner` が `0x6004` を送って
+   製品が §10 の失敗状態（MIXER/Sink=false）に落ちた**。原因は `tune_4k` の
+   「discover=Err なら 0x6004」フォールバック。**4K の API 再取得は discover=Ok の
+   ときのみ行うべき**（Err の状態で叩くと 0x6004 が飛ぶ）。
+4. 本体ボタンで青に入る経路は前面マイコン FPD/FPM → UIM で、電源ON 時の
+   前回チャンネル復元（`eSdmGetLastChInfo` → `WAIT_TUNE_LAST_CH`）と推定。
+   ソフトリブートが復帰しない差は起動種別の差で説明できる（未確定）。
