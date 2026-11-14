@@ -1016,3 +1016,41 @@ Err 状態（22:08, `MIXER/Sink=true`, `si=161/45329`, `discover=Err`）から 1
   §10 と同じ失敗状態で、緑復帰待ち（本体ボタン）。
 - 実施: bring-up 1 回 / `send` 計 6 回 / `t4s-tuner` 3 回 / API 3 回 / read-only 観測。
   キー連打・電源操作・reboot は行っていない。
+
+### 15.7 追記（2026-11-14 23:51 – 2026-11-15 00:08 JST）: 緑復帰後の確認検証と os error 1038
+
+ユーザーが本体ボタンで緑に復帰（`mirakc` pid 937 / `t4s-remote` pid 941、23:51:29 に
+`MIXER/Sink/buf_buf=true`, `si=141/45170`, `discover=Ok(readers 1/2)`）。安全運用
+（1 手ずつ・各後 discover 確認・10 秒以上あける・API 不使用）で再確認した。
+
+| # | 操作 | si | discover | 取得 |
+|---|---|---|---|---|
+| 開始 | 緑 | 141/45170 | Ok(1,2,8) | — |
+| CV-A | `t4s-tuner --channel 45170 --duration 6` 直接（tap 無し・3 回試行） | 141/45170 | **Ok 維持** | **rc=1 / 0 B / os error 1038**（REMUX open failed, retried once → 失敗） |
+| CV-B | `send 101 0 0` | →**101/45328** | 一過性 Err → Ok(0,0,8) → **Ok(1,2,8) に回復** | — |
+| CV-C | `t4s-tuner --channel 45328 --duration 6` 直接 | 101/45328 | Ok 維持 | **rc=1 / 0 B / os error 1038** |
+| CV-D | `send 141 0 0` | **101/45328 のまま変化せず** | → **Err（持続）** | — |
+
+最終状態（00:08）: `MIXER/Sink/buf_buf=true`（製品デコードは生存）だが `discover=Err`
+（持続）、`si=101/45328`。4 回以上ポーリングしても Err のまま。以降は送信を停止。
+
+**観測 1: `t4s-tuner` 直接は os error 1038 で失敗しうる（discover=Ok でも）**。
+`rust/t4s-core/src/bs2k.rs:328-338` / `tssrc.rs` の記載どおり、以前の host REMUX tap が
+解放されず残っていると `SDEV_CREATE` / REMUX create が **XCE_TIMEOUT(1038)** を返す。
+今回はセッション開始時点（緑・`discover=Ok`）から既に 1038 だった。**製品デコード
+（`discover`）が健全でも、host tap 側は wedged になりうる**。これは §13.2 / §15.3 の
+「API 連続取得」の残骸とみられ、`scripts/softreboot.sh` の記載どおり**再起動でしか
+解放されない**（CV-B の 0x6004 再構築で一時的に回復したが、CV-C で再発）。
+
+**観測 2: 0x6004 は wedged tap を一時的に解消しうるが、恒久復帰にはならない**。
+CV-B で `send 101` により discover が Ok に戻った（tap 再構築が通った）が、直後の
+CV-C で再び 1038。
+
+**観測 3: `discover=Err` 後は 0x6004 が効かない**。CV-D の `send 141 0 0` は si すら
+変えられず（101/45328 のまま）、discover=Err が持続。§15.4 の 3b2 と一致。
+
+**結論（確認検証）**: 前段の結論を再確認。**Err を避けるには (1) 緑のときだけ取得、
+(2) 1 局 1 回・10 秒以上あける、(3) tap と 0x6004 を近接させない、(4) Err では送らない、
+が有効**。加えて **緑でも host REMUX tap が wedged（os error 1038）なことがあり、その
+場合 `t4s-tuner` 直接取得は失敗する。回復は再起動のみ**。`discover` が Ok であることは
+host tap が健全であることを保証しない。
