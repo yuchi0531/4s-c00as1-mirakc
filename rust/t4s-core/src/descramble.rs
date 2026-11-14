@@ -321,6 +321,40 @@ impl<C: Card> Decoder<C> {
             }
         })
     }
+    /// Key/ECM side of the startup gate, shared by the full and partial paths.
+    fn keys_ready(&self) -> bool {
+        (self.routes.is_empty() || !self.keys.is_empty())
+            && if self.scrambled_pids.is_empty() {
+                self.routes.values().all(|pid| self.keys.contains_key(pid))
+            } else {
+                self.scrambled_pids.iter().all(|&pid| {
+                    self.ecm_for_pid(pid).map_or(
+                        self.all_services
+                            || (self.wanted_service.is_some() && !self.routes.contains_key(&pid)),
+                        |ecm| self.keys.contains_key(&ecm),
+                    )
+                })
+            }
+    }
+    /// Default gate: a wanted service needs only its own PMT; an unfiltered
+    /// multiplex waits for every PAT-declared PMT.
+    fn ready(&self) -> bool {
+        self.pat
+            && self.wanted_pmt.map_or(self.pmts == self.seen_pmts, |pid| {
+                self.seen_pmts.contains(&pid)
+            })
+            && self.keys_ready()
+    }
+    /// Fallback used when startup hits its size cap: start with whatever PMTs
+    /// actually arrived.  Requires at least one declared PMT to have been
+    /// received so that an all-absent TS still fails closed.
+    fn partial_ready(&self) -> bool {
+        self.pat
+            && self.wanted_pmt.map_or(!self.seen_pmts.is_empty(), |pid| {
+                self.seen_pmts.contains(&pid)
+            })
+            && self.keys_ready()
+    }
     fn emit(&mut self, mut p: [u8; 188], out: &mut Vec<u8>) -> io::Result<()> {
         let sc = p[3] >> 6;
         if sc != 0 {
@@ -384,27 +418,27 @@ impl<C: Card> Decoder<C> {
                     self.scrambled_pids.insert(pid);
                 }
                 if self.waiting.len() > 22_000 {
-                    return Err(io::Error::new(io::ErrorKind::InvalidData,format!(
-                        "BS2K startup exceeded 4 MiB: PMTs={:?} seen={:?} ECMs={:?} accepted={:?} scrambled_PIDs={:?}",
-                        self.pmts,self.seen_pmts,self.routes.values().collect::<BTreeSet<_>>(),self.keys.keys().collect::<Vec<_>>(),self.scrambled_pids)));
-                }
-                if self.pat
-                    && self.wanted_pmt.map_or(self.pmts == self.seen_pmts, |pid| {
-                        self.seen_pmts.contains(&pid)
-                    })
-                    && (self.routes.is_empty() || !self.keys.is_empty())
-                    && if self.scrambled_pids.is_empty() {
-                        self.routes.values().all(|pid| self.keys.contains_key(pid))
+                    if self.partial_ready() {
+                        eprintln!(
+                            "t4s-cas: warning: starting with partial PMTs after 4 MiB: PMTs={:?} seen={:?} missing={:?} ECMs={:?} accepted={:?} scrambled_PIDs={:?}",
+                            self.pmts,
+                            self.seen_pmts,
+                            self.pmts.difference(&self.seen_pmts).collect::<BTreeSet<_>>(),
+                            self.routes.values().collect::<BTreeSet<_>>(),
+                            self.keys.keys().collect::<Vec<_>>(),
+                            self.scrambled_pids
+                        );
+                        self.started = true;
+                        while let Some(p) = self.waiting.pop_front() {
+                            self.emit(p, out)?;
+                        }
                     } else {
-                        self.scrambled_pids.iter().all(|&pid| {
-                            self.ecm_for_pid(pid).map_or(
-                                self.all_services
-                                    || (self.wanted_service.is_some() && !self.routes.contains_key(&pid)),
-                                |ecm| self.keys.contains_key(&ecm),
-                            )
-                        })
+                        return Err(io::Error::new(io::ErrorKind::InvalidData,format!(
+                            "BS2K startup exceeded 4 MiB: PMTs={:?} seen={:?} ECMs={:?} accepted={:?} scrambled_PIDs={:?}",
+                            self.pmts,self.seen_pmts,self.routes.values().collect::<BTreeSet<_>>(),self.keys.keys().collect::<Vec<_>>(),self.scrambled_pids)));
                     }
-                {
+                }
+                if !self.started && self.ready() {
                     self.started = true;
                     while let Some(p) = self.waiting.pop_front() {
                         self.emit(p, out)?;
@@ -458,6 +492,71 @@ mod tests {
             packet(0x100, 0, &pmt),
             packet(0x121, 0, &ecm),
         ]
+    }
+    fn null_packet(cc: u8) -> [u8; 188] {
+        let mut p = [0xff; 188];
+        p[..4].copy_from_slice(&[0x47, 0x1f, 0xff, 0x10 | (cc & 0x0f)]);
+        p
+    }
+    fn filler(n: usize) -> Vec<u8> {
+        (0..n).flat_map(|i| null_packet(i as u8)).collect()
+    }
+    #[test]
+    fn startup_begins_with_arrived_pmts_when_declared_pmt_never_comes() {
+        // PAT declares PMTs 0x100 and 0x200, but only 0x100 arrives (the
+        // BS13_0 1025/1026 shape).  The stream must start, not abort.
+        let pat = section(vec![
+            0, 0xb0, 0, 0x40, 0x10, 0xc1, 0, 0, 0, 151, 0xe1, 0, 0, 152, 0xe2, 0,
+        ]);
+        let ts = tables();
+        let mut d = Decoder::new(Fake { calls: 0 }, [0; 32], [0; 8], 0x4010).all_services();
+        let mut out = Vec::new();
+        d.push(&packet(0, 0, &pat), &mut out).unwrap();
+        d.push(&ts[1], &mut out).unwrap();
+        d.push(&ts[2], &mut out).unwrap();
+        assert!(out.is_empty());
+        assert!(!d.started);
+        // More than the 22_000-packet / 4 MiB startup budget.
+        d.push(&filler(22_050), &mut out).unwrap();
+        assert!(d.started);
+        assert_eq!(d.card.calls, 1);
+        assert_eq!(d.pmts.len(), 2);
+        assert_eq!(d.seen_pmts.len(), 1);
+        assert!(out.len() >= 22_050 * 188);
+    }
+    #[test]
+    fn startup_still_aborts_when_no_declared_pmt_arrives() {
+        let pat = section(vec![
+            0, 0xb0, 0, 0x40, 0x10, 0xc1, 0, 0, 0, 151, 0xe1, 0, 0, 152, 0xe2, 0,
+        ]);
+        let mut d = Decoder::new(Fake { calls: 0 }, [0; 32], [0; 8], 0x4010).all_services();
+        let mut out = Vec::new();
+        d.push(&packet(0, 0, &pat), &mut out).unwrap();
+        let err = d.push(&filler(22_050), &mut out).unwrap_err();
+        assert!(err.to_string().contains("exceeded 4 MiB"));
+        assert!(!d.started);
+    }
+    #[test]
+    fn startup_uses_the_gate_normally_when_every_declared_pmt_arrives() {
+        let pat = section(vec![
+            0, 0xb0, 0, 0x40, 0x10, 0xc1, 0, 0, 0, 151, 0xe1, 0, 0, 152, 0xe2, 0,
+        ]);
+        let second = {
+            let s = section(vec![
+                2, 0xb0, 0, 0, 152, 0xc1, 0, 0, 0xe1, 0x40, 0xf0, 6, 9, 4, 0, 5, 0xe1, 0x21,
+            ]);
+            packet(0x200, 0, &s)
+        };
+        let ts = tables();
+        let mut d = Decoder::new(Fake { calls: 0 }, [0; 32], [0; 8], 0x4010).all_services();
+        let mut out = Vec::new();
+        d.push(&packet(0, 0, &pat), &mut out).unwrap();
+        d.push(&ts[1], &mut out).unwrap();
+        d.push(&ts[2], &mut out).unwrap();
+        d.push(&second, &mut out).unwrap();
+        assert!(d.started);
+        assert!(d.waiting.is_empty());
+        assert_eq!(out.len(), 4 * 188);
     }
     #[test]
     fn incremental_startup_deduplicates_ecm_and_decrypts_without_touching_psi() {
