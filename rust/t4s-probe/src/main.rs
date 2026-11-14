@@ -8,6 +8,87 @@ use t4s_core::{
     xcdrv::XcDrv,
 };
 
+mod xcfb;
+
+/// `t4s-probe xcfb [reg]` — read-only `/dev/xcfb_disp` probe.
+///
+/// Opens the display device and issues only read sub-commands of the XCFB DISP
+/// ioctl (request 0x61000).  No write/metadata/HDCP command is sent.  Used to
+/// decide whether an HDMI sink is electrically present (HPD/RSEN) and whether
+/// its EDID is readable, without touching the box otherwise.
+fn xcfb_probe() {
+    let dev = "/dev/xcfb_disp";
+    let mut x = match xcfb::Xcfb::open(dev) {
+        Ok(x) => x,
+        Err(e) => {
+            println!("xcfb open {dev} ERR {e}");
+            return;
+        }
+    };
+    println!("xcfb ioctl=0x{:x} dev={dev}", xcfb::XCFB_DISP_IOCTL);
+
+    match x.lock() {
+        Ok(token) => println!("lock token={token:#x}"),
+        Err(e) => println!("lock ERR {e}"),
+    }
+
+    match x.plug_state() {
+        Ok((combined, hpd, rsen)) => println!(
+            "plug_state combined={combined:#x} (0x523={hpd:#x} bit0=HPD, 0x524={rsen:#x} bit1=RSEN)"
+        ),
+        Err(e) => println!("plug_state ERR {e}"),
+    }
+
+    // Known-good TMDS register from abs:TMDS_Enable (0x3004, 0x3000|0xc6, ...).
+    let regs: Vec<u32> = match std::env::args().nth(2) {
+        Some(v) => {
+            let t = v.trim();
+            let h = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")).unwrap_or(t);
+            match u32::from_str_radix(h, 16) {
+                Ok(r) => vec![r],
+                Err(_) => vec![0x3004, 0x3000, 0x3020],
+            }
+        }
+        None => vec![0x3004, 0x3000, 0x3020, 0x3006],
+    };
+    for r in regs {
+        match x.read_reg(r) {
+            Ok(v) => println!("read_reg addr={r:#06x} value={v:#010x}"),
+            Err(e) => println!("read_reg addr={r:#06x} ERR {e}"),
+        }
+    }
+
+    match x.edid_block_count() {
+        Ok(n) => {
+            println!("edid_block_count={n}");
+            let blocks = n.min(4);
+            for b in 0..blocks {
+                match x.edid_read_block(b) {
+                    Ok(buf) => {
+                        let hdr: Vec<String> = buf[..8].iter().map(|v| format!("{v:02x}")).collect();
+                        let std_hdr = buf[..8] == [0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00];
+                        println!(
+                            "edid_block[{b}] hdr={} std_header={std_hdr} first16={:02x?}",
+                            hdr.join(" "),
+                            &buf[..16]
+                        );
+                    }
+                    Err(e) => println!("edid_read_block[{b}] ERR {e}"),
+                }
+            }
+            if blocks == 0 {
+                println!("edid: no blocks (sink absent or EDID not readable)");
+            }
+        }
+        Err(e) => println!("edid_block_count ERR {e}"),
+    }
+
+    match x.unlock() {
+        Ok(()) => println!("unlock ok"),
+        Err(e) => println!("unlock ERR {e}"),
+    }
+}
+
 fn graph_dump(drv: &Arc<XcDrv>) {
     let g = Graph::read().expect("graph");
     println!("ctx={:#x}", g.ctx);
@@ -52,6 +133,10 @@ fn graph_dump(drv: &Arc<XcDrv>) {
 
 fn main() {
     let arg = std::env::args().nth(1).unwrap_or_default();
+    if arg == "xcfb" {
+        xcfb_probe();
+        return;
+    }
     if arg == "osd" {
         use std::io::Write;
         use std::os::unix::io::AsRawFd;
