@@ -678,7 +678,10 @@ impl Tap {
         self.running = true;
 
         let reader = d.create_reader(self.tsout)?;
-        self.src = Some(XcReaderSource::adopt(Arc::clone(&d), self.tsout, reader, 500));
+        // A short read timeout bounds how long `pump` can notice a stop flag
+        // (SIGTERM) between reads; the teardown after it must fit inside
+        // mirakc's two-second SIGTERM grace. Data still returns immediately.
+        self.src = Some(XcReaderSource::adopt(Arc::clone(&d), self.tsout, reader, 100));
         if self.tsinfo != 0 {
             d.set_buffer_ready(self.tsinfo)?;
             let info_reader = d.create_reader(self.tsinfo)?;
@@ -897,15 +900,46 @@ fn timeout_noise(e: &io::Error) -> bool {
     matches!(e.raw_os_error(), Some(1038 | 1039))
 }
 
+/// Wall-clock budget for a whole teardown.
+///
+/// mirakc runs the 4K tuner with `--duration -` and, when the client
+/// disconnects, sends SIGTERM then SIGKILL after a two-second grace
+/// (`mirakc-core/src/command_util.rs`, `COMMAND_PIPELINE_SIGTERM_GRACE_NANOS`).
+/// If the graph close takes longer than that it is killed mid-teardown and the
+/// REMUX device keeps the live ES readers attached, so the next open fails
+/// (the observed `readers 1/2 -> 2/3` then 404). Every step below is bounded so
+/// the total stays well inside the grace.
+pub const TEARDOWN_BUDGET: Duration = Duration::from_millis(700);
+
+/// Per-device-control timeout during teardown. Shorter than the budget so a
+/// single parked command (XCE_TIMEOUT, os error 1038) cannot consume it all.
+pub const TEARDOWN_OP_TIMEOUT_MS: u32 = 200;
+
+/// Retry an idempotent cleanup op while it reports benign timeout noise, but
+/// never past the shared `deadline`: mirakc may SIGKILL the tuner two seconds
+/// after SIGTERM, so a teardown that stops retrying once the budget is gone
+/// still detaches the graph instead of being killed with the readers attached.
+///
+/// Once `deadline` has passed the op is skipped and reported as benign
+/// timeout noise (os error 1038). Skipping is the lesser evil: the process is
+/// about to be SIGKILLed anyway, and a clean early return lets the caller log
+/// what it did not reach rather than leaving the readers attached silently.
 fn retry_cleanup<T>(
     label: &str,
     attempts: u32,
     delay: Duration,
+    deadline: Instant,
     mut op: impl FnMut() -> io::Result<T>,
 ) -> io::Result<T> {
     let attempts = attempts.max(1);
     let mut last: Option<io::Error> = None;
     for attempt in 0..attempts {
+        if attempt > 0 && Instant::now() >= deadline {
+            eprintln!(
+                "remux4k: teardown {label}: budget exhausted; skipping the remaining retries"
+            );
+            return Err(io::Error::from_raw_os_error(1038));
+        }
         match op() {
             Ok(value) => return Ok(value),
             Err(e) => {
@@ -934,6 +968,7 @@ fn close_graph<O: RemuxOps + ?Sized>(
         ..Default::default()
     };
     let device = handles.device;
+    let deadline = Instant::now() + TEARDOWN_BUDGET;
 
     // 1. Detach the outputs first. Retry immediately; if the writer is parked
     //    in a full ring the retry after stop_device is the one that clears.
@@ -945,8 +980,8 @@ fn close_graph<O: RemuxOps + ?Sized>(
         if connection == 0 || device == 0 {
             continue;
         }
-        match retry_cleanup(label, 2, Duration::from_millis(100), || {
-            ops.disconnect(device, connection, 3000)
+        match retry_cleanup(label, 2, Duration::from_millis(100), deadline, || {
+            ops.disconnect(device, connection, TEARDOWN_OP_TIMEOUT_MS)
         }) {
             Ok(()) => {}
             Err(e) if timeout_noise(&e) => {
@@ -969,8 +1004,8 @@ fn close_graph<O: RemuxOps + ?Sized>(
     // 2. Stop the device, then retry the output detach that timed out: a
     //    stopped writer can answer even if it was parked before.
     if handles.running && device != 0 {
-        match retry_cleanup("stop", 3, Duration::from_millis(150), || {
-            ops.stop_device(device, 3000)
+        match retry_cleanup("stop", 3, Duration::from_millis(150), deadline, || {
+            ops.stop_device(device, TEARDOWN_OP_TIMEOUT_MS)
         }) {
             Ok(()) => {}
             Err(e) if timeout_noise(&e) => {
@@ -989,8 +1024,8 @@ fn close_graph<O: RemuxOps + ?Sized>(
     handles.running = false;
 
     for (label, connection) in retry_outputs {
-        match retry_cleanup(label, 2, Duration::from_millis(100), || {
-            ops.disconnect(device, connection, 3000)
+        match retry_cleanup(label, 2, Duration::from_millis(100), deadline, || {
+            ops.disconnect(device, connection, TEARDOWN_OP_TIMEOUT_MS)
         }) {
             Ok(()) => {}
             Err(e) if timeout_noise(&e) => {
@@ -1018,6 +1053,7 @@ fn close_graph<O: RemuxOps + ?Sized>(
                 &format!("remove {label} stream"),
                 2,
                 Duration::from_millis(100),
+                deadline,
                 || ops.remove_stream(device, connection, service_id),
             ) {
                 Ok(()) => {}
@@ -1035,7 +1071,7 @@ fn close_graph<O: RemuxOps + ?Sized>(
     handles.streams_added = false;
 
     if handles.program_added && device != 0 {
-        match retry_cleanup("remove program", 2, Duration::from_millis(100), || {
+        match retry_cleanup("remove program", 2, Duration::from_millis(100), deadline, || {
             ops.remove_program(device, service_id)
         }) {
             Ok(()) => {}
@@ -1060,8 +1096,8 @@ fn close_graph<O: RemuxOps + ?Sized>(
         if connection == 0 || device == 0 {
             continue;
         }
-        match retry_cleanup(label, 2, Duration::from_millis(100), || {
-            ops.disconnect(device, connection, 3000)
+        match retry_cleanup(label, 2, Duration::from_millis(100), deadline, || {
+            ops.disconnect(device, connection, TEARDOWN_OP_TIMEOUT_MS)
         }) {
             Ok(()) => {}
             Err(e) if timeout_noise(&e) => {
@@ -1092,6 +1128,9 @@ fn close_graph<O: RemuxOps + ?Sized>(
             if clear {
                 break;
             }
+            if Instant::now() >= deadline {
+                break;
+            }
             std::thread::sleep(Duration::from_millis(50));
         }
         if !clear {
@@ -1104,6 +1143,7 @@ fn close_graph<O: RemuxOps + ?Sized>(
             &format!("reset {label}"),
             2,
             Duration::from_millis(100),
+            deadline,
             || ops.force_reset_buffer(buffer),
         ) {
             Ok(()) => {}
@@ -1117,6 +1157,7 @@ fn close_graph<O: RemuxOps + ?Sized>(
             &format!("destroy {label}"),
             2,
             Duration::from_millis(100),
+            deadline,
             || ops.destroy_buffer(buffer),
         ) {
             Ok(()) => {
@@ -1145,7 +1186,7 @@ fn close_graph<O: RemuxOps + ?Sized>(
 
     // 6. Destroy the device last, once nothing points at it.
     if device != 0 {
-        match retry_cleanup("destroy REMUX", 2, Duration::from_millis(100), || {
+        match retry_cleanup("destroy REMUX", 2, Duration::from_millis(100), deadline, || {
             ops.destroy_device(device)
         }) {
             Ok(()) => handles.device = 0,
@@ -1431,5 +1472,22 @@ mod close_tests {
         assert_eq!(report.leaked_buffers, vec![0x60]);
         assert!(ops.failures.borrow().is_empty());
         assert_eq!(handles, CloseHandles::default());
+    }
+
+    /// mirakc sends SIGTERM then SIGKILL two seconds later, so the whole graph
+    /// close must finish inside that grace or the tuner is killed with the
+    /// live ES readers still attached (the §17 API failure). The budget plus
+    /// the per-op timeout are the bound that keeps it inside.
+    #[test]
+    fn teardown_budget_and_op_timeout_stay_inside_the_sigterm_grace() {
+        const SIGTERM_GRACE: Duration = Duration::from_secs(2);
+        assert!(
+            TEARDOWN_BUDGET < SIGTERM_GRACE,
+            "TEARDOWN_BUDGET {TEARDOWN_BUDGET:?} must be under the SIGTERM grace {SIGTERM_GRACE:?}"
+        );
+        assert!(
+            Duration::from_millis(u64::from(TEARDOWN_OP_TIMEOUT_MS)) < TEARDOWN_BUDGET,
+            "a single op timeout must fit inside the whole-teardown budget"
+        );
     }
 }

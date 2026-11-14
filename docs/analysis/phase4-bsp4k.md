@@ -1328,3 +1328,109 @@ API #1 自体は健全な 4K TS を返している（旧 §13.1 と同じ）。
 - mirakc pid 989 / t4s-remote pid 993 稼働。製品は `MIXER/Sink=false`, `si=141/45170`,
   `discover=Err`（§10 失敗状態、緑復帰待ち）。
 - 実施: API #1/#2 の 2 回のみ。0x6004・キー・電源/reboot は行っていない。
+
+---
+
+## 18. 追記（2026-11-15）: SIGTERM 時に teardown を完走させる — コード実装（実機未検証）
+
+§17 で、修正版 `t4s-tuner` でも mirakc API の連続取得が 404 / `discover=Err` に陥ることを
+確認した。原因をコードで特定し、対策を実装した。**本節はホスト側の実装・ユニットテストのみ。
+実機は Err（復帰待ち）のため、実機検証は §18.5 の手順を緑復帰後に行う（未実施）。**
+
+### 18.1 原因（確定）
+
+- mirakc は tuner を `--duration -` で spawn し、クライアント切断時に
+  **SIGTERM → 2 秒の猶予 → SIGKILL**（`mirakc-core/src/command_util.rs:51-310`,
+  `COMMAND_PIPELINE_SIGTERM_GRACE_NANOS_DEFAULT = 2s`, `kill_on_drop(true)`）。
+- `t4s-tuner` は既に SIGTERM/SIGINT を捕捉して `AtomicBool STOP` を立て、`pump` が
+  それを観測して抜け、`Tap` の `Drop`→冪等 `close()` を走らせる設計だった
+  （`main.rs:31-46`, `remux4k.rs:1228`）。**しかし teardown の各 device-control は
+  timeout 3000 ms**（`disconnect`/`stop_device`）で、しかも再試行するため、
+  **parked（XCE_TIMEOUT=1038）時に合計が 2 秒を大きく超え得る**。
+- 結果、mirakc の SIGKILL が **teardown の途中**で発火し、REMUX device が live ES
+  reader を付けたまま残る。これが §17 の「API#1 後に readers 1/2→2/3」「API#2 が
+  最初の TS パケットを得られず 404」に一致する。
+- 直接 `--duration 10`（正常終了）は kill されず teardown が完走するため合格していた
+  （§16.7）。**差は「外部 kill されるか」だけ**。
+
+### 18.2 実装方針（signal-safe）
+
+1. シグナルハンドラは **`AtomicBool` への store のみ**（`main.rs:37-39`）。
+   ioctl・alloc・ログ等は一切しない（async-signal-safe 維持）。teardown は
+   ループを抜けた**通常スレッド**で実行する。
+2. `pump` はループ先頭と**読み取り直後**の両方で停止条件を確認（`main.rs:138-160`）。
+   停止判定は `pump_should_exit(stop, deadline, now)` に切り出し、テスト可能にした
+   （`main.rs:54-59`）。
+3. teardown 全体に **wall-clock 予算 `TEARDOWN_BUDGET = 700 ms`** を導入
+   （`remux4k.rs:909`）。`close_graph` は開始時に `deadline = now + TEARDOWN_BUDGET`
+   を計算し、各 `retry_cleanup` に渡す。
+4. device-control の **per-op timeout を 3000 ms → `TEARDOWN_OP_TIMEOUT_MS = 200 ms`**
+   に短縮（`remux4k.rs:913`）。
+5. `retry_cleanup` は **deadline 超過後は再試行を打ち切り**、benign timeout（1038）と
+   して返す（`remux4k.rs:924-954`）。「budget exhausted; skipping the remaining
+   retries」をログ。次 open を妨げる実体（ring/device が残存）は従来どおり
+   `cleanup_ok=false` の hard leak として報告する（隠さない）。
+6. ring の writer/reader 待ちループも deadline で打ち切る（最大 40×50 ms = 2 s →
+   予算内で `break`）。
+7. **冪等 close は維持**（`closed` フラグ、handles の段階的な 0 クリア）。正常終了パス
+   （`--duration N`）も不変。
+
+### 18.3 タイムアウト合計（2 秒の猶予内）
+
+- シグナル受信 → `pump` 離脱: 最長で 1 回の `read_into`（TSOUT reader 100 ms）+
+  5 ms。→ **≤ 約 105 ms**。
+- `Tap::close()` 冒頭の `drain`: 最大 250 ms。
+- `close_graph`: `TEARDOWN_BUDGET = 700 ms` で打ち切り。
+- 最悪合計 ≈ **105 + 250 + 700 ≈ 1055 ms < 2000 ms**（mirakc の SIGTERM 猶予）。
+- 正常時は各 op が即時完了し、実測 ~300–350 ms（§16.7 の 300 ms 待機と同等）。
+
+### 18.4 ユニットテスト（ホスト側で実施済み）
+
+- `t4s-core`: **151 passed / 0 failed**（既存 150 + 追加 1）。
+  - `teardown_budget_and_op_timeout_stay_inside_the_sigterm_grace`:
+    `TEARDOWN_BUDGET < 2 s` かつ `TEARDOWN_OP_TIMEOUT_MS < TEARDOWN_BUDGET` を assert。
+  - 既存の冪等性テスト（`second_close_is_a_no_op…`）、順序テスト、1038 benign、
+    ring 残存 hard leak は維持。
+- `t4s-tuner`: **3 passed / 0 failed**。
+  - `pump_exits_when_the_stop_flag_is_set`（stop フラグで抜ける）。
+  - `pump_exits_when_the_duration_deadline_passes`（duration 満了で抜ける）。
+  - `a_dash_duration_has_no_deadline_and_relies_on_the_signal`
+    （`--duration -` は時間では抜けず、シグナルでのみ抜ける）。
+- `cargo check --workspace --release --target armv7-unknown-linux-musleabihf` → 成功
+  （既存の `t4s-call` 警告のみ）。
+- ビルド: `cargo +1.99.0 build --release --target armv7-unknown-linux-musleabihf
+  -p t4s-tuner` → 成功 / md5 `4598d1bc7e1d5c92b1ce2ca703165c27` / 568,668 B。
+
+### 18.5 実機検証手順（未実施）
+
+前提: 本体ボタン＋再起動で緑復帰（`MIXER/Sink=true`, `discover=Ok(1,2)`）。
+配置: 新 `t4s-tuner`（md5 `4598d1bc…`）を `/mnt/t4s/opt/t4s/bin/t4s-tuner` へ。
+
+1. 緑確認: `t4s-probe-new discover` → `Ok(video_readers 1, audio_readers 2)`。
+2. mirakc 起動（`sh /media/usb/ondevice-up.sh`）。
+3. API を **10 秒間隔で 3 回**:
+   ```sh
+   for i in 1 2 3; do
+     curl -sS --max-time 20 -o /tmp/api4k-$i.ts \
+       -w "run $i code=%{http_code} bytes=%{size_download}\n" \
+       'http://127.0.0.1:40772/api/channels/BS4K/45170/stream?decode=1'
+     t4s-probe-new discover
+     sleep 10
+   done
+   ```
+4. 合格条件:
+   - 3 回とも HTTP **200** / bytes > 0。
+   - 各回後の `discover` が **Ok(readers 1/2)** のまま（**readers が 1/2 から
+     2/3 等へ増えない**こと = leak していない）。
+   - 3 回目後も `MIXER/Sink=true`。
+5. 不合格（404 / Err / readers 増加）なら、即停止し `/tmp/api4k-*.ts` と
+   `discover`、mirakc ログを保存。再起動で復帰し、原因を再解析する。
+
+### 18.6 残課題
+
+- 実機検証は **未実施**（緑復帰待ち）。
+- 予算 700 ms で全 op を打ち切る場合、掃除しきれない resource が生じ得る。ただし
+  **kill されるより「早期に離脱して実体を減らす」方が次 open の成功率が高い**と
+  考えられる（仮説）。実機で readers が増えないことを確認する必要がある。
+- mirakc 側の SIGTERM 猶予を延ばす（`MIRAKC_COMMAND_PIPELINE_SIGTERM_GRACE_NANOS`）
+  選択肢もあるが、サーバ設定側の変更であり本節の範囲外。

@@ -34,6 +34,9 @@ extern "C" {
     fn signal(signum: i32, handler: usize) -> usize;
 }
 
+/// Async-signal-safe: only stores to an `AtomicBool`. No allocation, no
+/// ioctl, no logging. `pump` observes the flag and performs the graph
+/// teardown on the normal thread after the loop returns.
 extern "C" fn on_signal(_: i32) {
     STOP.store(true, Ordering::SeqCst);
 }
@@ -43,6 +46,13 @@ fn install_signal_handlers() {
         signal(2, on_signal as *const () as usize); // SIGINT
         signal(15, on_signal as *const () as usize); // SIGTERM
     }
+}
+
+/// True when `pump` should leave its loop: a signal arrived or the
+/// `--duration` deadline passed. `--duration -` has no deadline, so it relies
+/// entirely on the signal flag (mirakc terminates the process on disconnect).
+fn pump_should_exit(stop: &AtomicBool, deadline: Option<Instant>, now: Instant) -> bool {
+    stop.load(Ordering::Relaxed) || deadline.is_some_and(|d| now >= d)
 }
 
 fn usage() -> ! {
@@ -139,10 +149,7 @@ fn pump(mut source: impl TsSource, deadline: Option<Instant>) -> io::Result<()> 
     let mut out = io::stdout().lock();
     let mut buf = Vec::with_capacity(256 * 1024);
     loop {
-        if STOP.load(Ordering::Relaxed) {
-            return Ok(());
-        }
-        if deadline.is_some_and(|d| Instant::now() >= d) {
+        if pump_should_exit(&STOP, deadline, Instant::now()) {
             return Ok(());
         }
         buf.clear();
@@ -153,6 +160,12 @@ fn pump(mut source: impl TsSource, deadline: Option<Instant>) -> io::Result<()> 
                 out.flush()?;
             }
             Err(e) => return Err(e),
+        }
+        // Check again right after a read: a signal that arrived while the
+        // reader was blocked must end the loop before the next read so the
+        // caller's teardown runs inside mirakc's SIGTERM grace.
+        if pump_should_exit(&STOP, deadline, Instant::now()) {
+            return Ok(());
         }
     }
 }
@@ -346,5 +359,37 @@ fn run_2k(args: &Args, deadline: Option<Instant>) -> Result<(), String> {
             eprintln!("t4s-tuner: frontend restore warning: {e}");
             result
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pump_exits_when_the_stop_flag_is_set() {
+        let stop = AtomicBool::new(false);
+        let now = Instant::now();
+        assert!(!pump_should_exit(&stop, None, now));
+        stop.store(true, Ordering::SeqCst);
+        assert!(pump_should_exit(&stop, None, now));
+    }
+
+    #[test]
+    fn pump_exits_when_the_duration_deadline_passes() {
+        let stop = AtomicBool::new(false);
+        let now = Instant::now();
+        let deadline = Some(now + Duration::from_secs(1));
+        assert!(!pump_should_exit(&stop, deadline, now));
+        assert!(pump_should_exit(&stop, deadline, now + Duration::from_secs(1)));
+        assert!(pump_should_exit(&stop, deadline, now + Duration::from_secs(2)));
+    }
+
+    #[test]
+    fn a_dash_duration_has_no_deadline_and_relies_on_the_signal() {
+        let stop = AtomicBool::new(false);
+        let far = Instant::now() + Duration::from_secs(86_400);
+        // With `--duration -` the deadline is None: time alone never exits.
+        assert!(!pump_should_exit(&stop, None, far));
     }
 }
