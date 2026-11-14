@@ -6,14 +6,17 @@
 ES リング**（video 20 MiB / audio 2 MiB）と、XCode6 の **REMUX** が必要です。
 この 2 つは本体が実際に 4K サービスをデコードしている間だけ存在します。
 
-> **2026-11-14 追記（要確認）**: HDMI 未接続と報告された状態で、製品が
-> 4K(141/45170) を **live デコード中**（`discover=Ok{video_readers:1,audio_readers:2}`,
-> MIXER/Sink/buf_buf スレッドあり, ES ring 進行）となり、`t4s-tuner --type BS4K` で
-> HEVC Main10 4K HLG + AAC-LATM の TS を 2 回連続取得できた実測がある。
-> read-only では HDMI シンクの有無を確定できず（`/sys/class/drm` 無し・dmesg に
-> HPD 無し・i2c-1 0x50 から EDID ヘッダが読めない）、**EDID エミュレータ/ダミー
-> プラグか HDMI ケーブルが実際に接続されている可能性**が高い。物理接続の目視確認が
-> 必要。詳細は [phase4-bsp4k.md §9](analysis/phase4-bsp4k.md)。
+> **2026-11-14 追記（決定的テスト済み）**: 「HDMI が要るのは初期設定ウィザードを
+> 抜けるためだけ」という仮説を実機ソフトリブートで検証した結果、**HDMI 無し再起動では
+> 4K 視聴へ自動復帰しない**（復帰後 `si=None` / `discover=Err` / `devices count=11`、
+> OSD はカラーバー）。`send 141 0 0` を 1 回送ると SI は入り devices は 11→22 に
+> 増えるが `discover=Ok` は約 12 秒で `Err` に戻り、**readers が定着しない**。
+> つまり選局（SI）は記憶されるが、**HDMI シンクが無いと 4K デコーダ（ES ring の
+> reader）が付かない**。先の §9 の「HDMI 未接続で 4K live」は、当時 HDMI シンク
+> （ケーブルまたは EDID エミュレータ）が実際に接続されており、外れても視聴状態の間は
+> デコードが継続していた（下記 選択肢 2 の挙動）と解釈するのが最も整合的。
+> したがって **「初期設定だけでなく 4K デコード開始そのものに HDMI が必要」**。
+> 詳細は [phase4-bsp4k.md §10](analysis/phase4-bsp4k.md)。
 
 本体は HDMI 出力先（TV / EDID を持つダミープラグ）を検出しないと
 デコードパイプライン（`MIXER` / `Sink` スレッド）を開始しません。
