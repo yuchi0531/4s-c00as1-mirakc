@@ -1054,3 +1054,141 @@ CV-C で再び 1038。
 が有効**。加えて **緑でも host REMUX tap が wedged（os error 1038）なことがあり、その
 場合 `t4s-tuner` 直接取得は失敗する。回復は再起動のみ**。`discover` が Ok であることは
 host tap が健全であることを保証しない。
+
+---
+
+## 16. 追記（2026-11-15）: 4K tap の teardown と os error 1038
+
+> 実機は Err（本体ボタン復帰待ち）のため、本節はホスト側のコード解析・修正・
+> ユニットテストのみ。実機アクセス・電源操作は行っていない。実機検証は §16.5 の
+> 手順を復帰後に実施する。
+
+### 16.1 1038 の正体と発生箇所
+
+- `os error 1038` は Rust の `io::Error::last_os_error()` が保持する **errno 1038**。
+  `xcdrv` の全 ioctl は `sys::ioctl_ptr`（`rust/t4s-core/src/sys.rs:39-43`）/
+  `sys::ioctl_value`（同 `:53-57`）を通り、失敗時にこの errno をそのまま返す。
+- このドライバでは **1038 = `XCE_TIMEOUT`**（`xcdrv.rs:267`、`docs/ARCHITECTURE.md:35`、
+  `docs/CS-STATUS.md:214`）。**`XCE_IN_USE`（-1040）ではない**。`tuner.rs:1163` の
+  `XCE_IN_USE` は「製品側が自分のバッファを解体する際、host tap がまだ
+  reader/connection を握っている」ときに製品側で起きるエラーで、1038 はその
+  上流（ARC がバッファ書き込みで詰まり、device-control が timeout する）現象。
+- `Tap::open` の失敗経路で 1038 を返し得る実呼び出しは、`XcDrv::create_remux`
+  （`SDEV_CREATE`, `xcdrv.rs:887-896`、実際の ioctl は `:890`）と
+  `XcDrv::create_remux_tsout_buffer` / `create_remux_tsinfo_buffer`
+  （`SBUF_CREATE`, `xcdrv.rs:916-936`）。今回のログは
+  `REMUX open failed (... os error 1038)` までで、どの ioctl かまでは出ていない。
+  **前回 tap の REMUX device / TSOUT・TSINFO ring が残っていれば、この create が
+  1038 で落ちる（推測。bs2k の `SDEV_CREATE` 1038 と同じ機序）**。
+- 一度 1038 になると再起動まで直らないのは、**残った device/ring を誰も
+  destroy できず、次の create が同じ timeout を返し続ける**ため。
+
+### 16.2 bs2k との差分（旧 remux4k teardown の問題）
+
+`bs2k::Source::drop`（`bs2k.rs:254-388`）は次を行う:
+
+1. `quiesce_ts_output` で出力元を止める。
+2. reader を drain する。
+3. PID/connection を外す。disconnect が timeout したら **stop して再試行**。
+4. ring の writer/reader が 0 になるまで待ち、`force_reset_buffer` →
+   `destroy_buffer`。
+5. destroy 後も `sbuf_status_raw` が成功するなら「ring が残っている = 次の
+   start は 1038」と**明示ログ**し、`dirty` を立てる。
+
+旧 `remux4k::Tap::teardown`（修正前）は:
+
+- reader を drop するだけで **drain しない**。
+- disconnect / stop が **timeout 2000 ms 固定・再試行なし**。
+- TSOUT/TSINFO ring を **reset せず、destroy 後の存在確認もしない**。
+- `Tap::close()` が無く、Drop だけ。二重解放の概念も無い。
+- `t4s-tuner` 終了直後にプロセスが消えるため、製品/ARC の後始末が次回 open と
+  競合し得る。
+
+つまり 2K で解消済みの「backpressure で ARC が詰まる → 全 device-control が
+1038 → ring が残る」に対する防御が、4K REMUX 側だけ欠けていた。
+
+### 16.3 修正内容
+
+- `remux4k::Tap` に **明示的 `close()` を追加**（`remux4k.rs:731`）。`Drop` からも
+  呼ぶ。`closed` フラグで**冪等**（二重 close で二重 destroy しない）。
+- teardown を `close_graph()`（`remux4k.rs:927`）に集約し、順序を固定:
+  1. TSOUT reader を **最大 250 ms drain** してから drop（writer の parked write
+     を解く）。
+  2. TSOUT/TSINFO の output connection を **timeout 3000 ms・再試行付き**で
+     disconnect。
+  3. `stop_device` を **timeout 3000 ms・再試行付き**で実行。
+  4. stop 後に timeout した output disconnect を**もう一度再試行**。
+  5. stream / program を remove（timeout は再試行後 benign）。
+  6. video/audio ES input を disconnect（同）。
+  7. TSOUT/TSINFO ring の writer/reader が 0 になるのを最大 2 s 待ち、
+     `force_reset_buffer` → `destroy_buffer`。**destroy 後も `sbuf_status_raw`
+     が成功するなら「解放できなかった」と明示ログ**し、cleanup 失敗として扱う。
+  8. 最後に REMUX device を destroy。失敗/timeout は同様に明示ログ。
+- **1038/1039 の扱いを分離**:
+  - disconnect / stop / remove / reset の timeout は **再試行後に benign**。
+  - ring/device の destroy 後に**実体が残っている場合は hard failure**。
+    「benign」で隠さず、`remux4k: teardown could not release ...` を残す
+    （`remux4k.rs:896` の `timeout_noise`、`:900` の `retry_cleanup`、
+    `:927-` の `close_graph` / `CloseReport`）。
+- `XcDrv::disconnect_timeout`（`xcdrv.rs:1278`）を追加し、REMUX 用 disconnect が
+  呼び出し側指定の timeout を使えるようにした（既存 `disconnect` は 2000 ms の
+  ままなので bs2k の挙動は不変）。
+- `t4s-tuner` の 4K 終了時に **300 ms の待機**を追加（`t4s-tuner/src/main.rs:270-275`）。
+  tap の Drop（=close）後に ARC の後始末が終わる前にプロセスが消えないようにする。
+
+### 16.4 ユニットテスト（ホスト側で実施済み）
+
+`rust/t4s-core/src/remux4k.rs` の `close_tests` で、実ドライバ無しに
+`RemuxOps` の fake を差し込んで検証:
+
+- `teardown_detaches_outputs_stops_then_destroys_rings_before_the_device`:
+  output disconnect → stop → stream/program remove → input disconnect →
+  reset/destroy ring → device destroy の順序を検証。
+- `second_close_is_a_no_op_and_does_not_destroy_anything_twice`:
+  2 回目の close が ioctl を一切追加しない（冪等）ことを検証。
+- `os_error_1038_on_disconnect_is_retried_and_then_benign`:
+  1038 が再試行後に benign になり、cleanup_ok を落とさないことを検証。
+- `a_ring_that_survives_destroy_is_reported_as_a_hard_leak`:
+  destroy 成功でも status が残る ring を leaked として報告することを検証。
+
+実行結果: `cargo test -p t4s-core` → **150 passed / 0 failed**。
+`cargo check --workspace --release --target armv7-unknown-linux-musleabihf` → 成功
+（既存の `t4s-call` の未使用 import/dead_code 警告のみ）。
+
+### 16.5 実機復帰後の検証手順（未実施）
+
+前提: 本体ボタンで緑復帰済み。**1038 が出たら 0x6004 を送らない**（§15.4）。
+
+1. 緑の確認:
+   ```sh
+   t4s-probe-new discover        # Ok(video_readers>=1, audio_readers>=1) を確認
+   ```
+2. 同一局を 3 回連続取得する。各回の間に **10 秒以上**あける:
+   ```sh
+   for i in 1 2 3; do
+     t4s-tuner --type BS4K --channel 45170 --duration 10 > /tmp/tap4k-$i.ts 2> /tmp/tap4k-$i.err
+     echo "run $i rc=$? bytes=$(stat -c %s /tmp/tap4k-$i.ts)"
+     t4s-probe-new discover
+     sleep 10
+   done
+   ```
+3. 合格条件:
+   - 3 回とも `rc=0` かつ `bytes > 0`。
+   - 3 回とも stderr に `os error 1038` が無い。
+   - 各回後の `discover` が `Ok(readers 1/2)` のまま。
+   - stderr に `remux4k: teardown could not release ...` が無い。
+4. 失敗時:
+   - `/tmp/tap4k-$i.err` と `discover` の出力を保存。
+   - `could not release buffer/device` が出た場合は host tap が残った可能性が高い。
+     それ以上 `t4s-tuner` / 0x6004 を連打せず、復帰手順（再起動）を検討する。
+
+### 16.6 未検証・残課題
+
+- 実機での 3 回連続取得は **未検証**（実機 Err のため）。
+- TSOUT ring は製品リテラルの 0x468000（4.5 MiB）のまま。ホスト読み出しが
+  4K の実ビットレートに追いつかない場合は、drain だけでは writer を解けず
+  再び 1038 になる可能性がある（**推測**。2K のように ring 拡大が必要になるかは
+  実機の bytes/所要時間を見て判断する）。
+- `discover=Ok` は製品デコードの健全性しか保証せず、host tap の残骸は検出しない
+  （§15.7 の観測どおり）。今回の修正は「残骸を作らない」方向の対策であり、
+  既に wedged な個体をソフトで解放するものではない。

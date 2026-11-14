@@ -1268,7 +1268,15 @@ impl XcDrv {
     }
 
     pub fn disconnect(&self, device: u32, connection: u32) -> io::Result<()> {
-        let mut req = [device, connection, 1, 2000];
+        self.disconnect_timeout(device, connection, 2000)
+    }
+
+    /// Same request with a caller-chosen timeout. A REMUX or DEMUX whose
+    /// output ring is full can be parked inside its write; it then answers
+    /// only after the writer is stopped, and any shorter timeout is
+    /// `XCE_TIMEOUT (os error 1038)`.
+    pub fn disconnect_timeout(&self, device: u32, connection: u32, ms: u32) -> io::Result<()> {
+        let mut req = [device, connection, 1, ms];
         unsafe { self.call(SDEV_DISCONNECT, &mut req)? };
         Ok(())
     }

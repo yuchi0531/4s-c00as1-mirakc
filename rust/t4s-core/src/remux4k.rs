@@ -542,6 +542,7 @@ pub struct Tap {
     running: bool,
     streams_added: bool,
     program_added: bool,
+    closed: bool,
     src: Option<XcReaderSource>,
     info_src: Option<XcReaderSource>,
     info_scratch: Vec<u8>,
@@ -622,6 +623,7 @@ impl Tap {
             running: false,
             streams_added: false,
             program_added: false,
+            closed: false,
             src: None,
             info_src: None,
             info_scratch: Vec::with_capacity(64 * 1024),
@@ -632,7 +634,7 @@ impl Tap {
             longest_gap: Duration::from_millis(0),
         };
         if let Err(e) = tap.build() {
-            tap.teardown();
+            tap.close();
             return Err(e);
         }
         Ok(tap)
@@ -714,65 +716,453 @@ impl Tap {
         None
     }
 
-    /// Reverse of `build`, in `remux_seq_stop` -> `remux_xcif_close_remux`
-    /// order: readers, stop, remove streams, remove program, disconnect
-    /// inputs then outputs, destroy buffers, destroy the device.
-    fn teardown(&mut self) {
+    /// Explicit, idempotent teardown. `Drop` calls this too, so a normal
+    /// session end and an error path release the same graph exactly once.
+    ///
+    /// The order mirrors the vendor's `remux_seq_stop` ->
+    /// `remux_xcif_close_remux`, with the output side detached first: a
+    /// REMUX parked inside a write to a full TSOUT ring answers every
+    /// device-control command with `XCE_TIMEOUT (os error 1038)`, and that is
+    /// exactly the state that leaves a device and its rings behind for the
+    /// next open. Timeouts on disconnect/stop are retried and then reported
+    /// as benign cleanup noise; a ring or device that is still present after
+    /// its destroy is a hard failure and is logged as "could not release"
+    /// rather than hidden.
+    pub fn close(&mut self) {
+        if self.closed {
+            return;
+        }
+        self.closed = true;
+
+        // Stop consuming and let the REMUX finish whatever it already wrote.
+        // Without this the writer can stay parked in the ring while we ask
+        // the driver to detach it.
+        drain(&mut self.src, Duration::from_millis(250));
         self.src = None;
         self.info_src = None;
-        let d = Arc::clone(&self.drv);
-        if self.running {
-            if let Err(e) = d.stop_device(self.device) {
-                eprintln!("mkra: warning: stop REMUX {:#x}: {e}", self.device);
-            }
-            self.running = false;
-        }
-        if self.streams_added {
-            for (label, conn) in [("video", self.conn_video), ("audio", self.conn_audio)] {
-                if let Err(e) = d.remux_remove_stream(self.device, conn, u32::from(self.cfg.service_id)) {
-                    eprintln!("mkra: warning: remove {label} stream: {e}");
-                }
-            }
-            self.streams_added = false;
-        }
-        if self.program_added {
-            if let Err(e) = d.remux_remove_program(self.device, u32::from(self.cfg.service_id)) {
-                eprintln!("mkra: warning: remove program: {e}");
-            }
-            self.program_added = false;
-        }
-        for (label, conn) in [
-            ("video ES input", self.conn_video),
-            ("audio ES input", self.conn_audio),
-            ("TSINFO output", self.conn_tsinfo),
-            ("TSOUT output", self.conn_tsout),
-        ] {
-            if conn != 0 {
-                if let Err(e) = d.disconnect(self.device, conn) {
-                    eprintln!("mkra: warning: disconnect {label} {conn:#x}: {e}");
-                }
-            }
-        }
-        self.conn_video = 0;
-        self.conn_audio = 0;
-        self.conn_tsinfo = 0;
-        self.conn_tsout = 0;
-        for (label, buffer) in [("TSINFO", self.tsinfo), ("TSOUT", self.tsout)] {
-            if buffer != 0 {
-                if let Err(e) = d.destroy_buffer(buffer) {
-                    eprintln!("mkra: warning: destroy {label} {buffer:#x}: {e}");
-                }
-            }
-        }
-        self.tsinfo = 0;
-        self.tsout = 0;
-        if self.device != 0 {
-            if let Err(e) = d.destroy_device(self.device) {
-                eprintln!("mkra: warning: destroy REMUX {:#x}: {e}", self.device);
-            }
-            self.device = 0;
+
+        let mut handles = CloseHandles {
+            device: self.device,
+            tsout: self.tsout,
+            tsinfo: self.tsinfo,
+            conn_tsout: self.conn_tsout,
+            conn_tsinfo: self.conn_tsinfo,
+            conn_video: self.conn_video,
+            conn_audio: self.conn_audio,
+            running: self.running,
+            streams_added: self.streams_added,
+            program_added: self.program_added,
+        };
+        let report = close_graph(
+            self.drv.as_ref(),
+            &mut handles,
+            u32::from(self.cfg.service_id),
+        );
+
+        self.device = handles.device;
+        self.tsout = handles.tsout;
+        self.tsinfo = handles.tsinfo;
+        self.conn_tsout = handles.conn_tsout;
+        self.conn_tsinfo = handles.conn_tsinfo;
+        self.conn_video = handles.conn_video;
+        self.conn_audio = handles.conn_audio;
+        self.running = handles.running;
+        self.streams_added = handles.streams_added;
+        self.program_added = handles.program_added;
+
+        if !report.cleanup_ok {
+            eprintln!(
+                "remux4k: teardown could not release {}; the next open will fail with \
+                 os error 1038 until the device is rebooted",
+                report.describe_leaks()
+            );
         }
     }
+}
+
+/// Drain a reader for at most `budget`, stopping after two consecutive empty
+/// reads. A REMUX with a full TSOUT ring is blocked inside its write until
+/// room appears, so emptying the ring is what lets the following disconnect
+/// and stop complete.
+fn drain(reader: &mut Option<XcReaderSource>, budget: Duration) {
+    let Some(reader) = reader.as_mut() else {
+        return;
+    };
+    let until = Instant::now() + budget;
+    let mut total = 0usize;
+    let mut scratch = Vec::with_capacity(64 * 1024);
+    let mut quiet = 0;
+    while Instant::now() < until && quiet < 2 {
+        scratch.clear();
+        match reader.read_into(&mut scratch) {
+            Ok(0) => quiet += 1,
+            Ok(n) => {
+                quiet = 0;
+                total += n;
+            }
+            Err(_) => break,
+        }
+    }
+    if total != 0 {
+        eprintln!("remux4k: teardown drained {total} bytes");
+    }
+}
+
+/// The driver operations teardown needs. Separated from `Tap` so the order,
+/// retry and idempotency rules can be exercised without a live driver.
+pub(crate) trait RemuxOps {
+    fn sbuf_status(&self, buffer: u32) -> io::Result<[u32; 12]>;
+    fn remove_stream(&self, device: u32, connection: u32, program: u32) -> io::Result<()>;
+    fn remove_program(&self, device: u32, program: u32) -> io::Result<()>;
+    fn disconnect(&self, device: u32, connection: u32, timeout_ms: u32) -> io::Result<()>;
+    fn stop_device(&self, device: u32, timeout_ms: u32) -> io::Result<()>;
+    fn force_reset_buffer(&self, buffer: u32) -> io::Result<()>;
+    fn destroy_buffer(&self, buffer: u32) -> io::Result<()>;
+    fn destroy_device(&self, device: u32) -> io::Result<()>;
+}
+
+impl RemuxOps for XcDrv {
+    fn sbuf_status(&self, buffer: u32) -> io::Result<[u32; 12]> {
+        self.sbuf_status_raw(buffer)
+    }
+    fn remove_stream(&self, device: u32, connection: u32, program: u32) -> io::Result<()> {
+        self.remux_remove_stream(device, connection, program)
+    }
+    fn remove_program(&self, device: u32, program: u32) -> io::Result<()> {
+        self.remux_remove_program(device, program)
+    }
+    fn disconnect(&self, device: u32, connection: u32, timeout_ms: u32) -> io::Result<()> {
+        self.disconnect_timeout(device, connection, timeout_ms)
+    }
+    fn stop_device(&self, device: u32, timeout_ms: u32) -> io::Result<()> {
+        self.stop_device_timeout(device, timeout_ms)
+    }
+    fn force_reset_buffer(&self, buffer: u32) -> io::Result<()> {
+        self.force_reset_buffer(buffer)
+    }
+    fn destroy_buffer(&self, buffer: u32) -> io::Result<()> {
+        self.destroy_buffer(buffer)
+    }
+    fn destroy_device(&self, device: u32) -> io::Result<()> {
+        self.destroy_device(device)
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct CloseHandles {
+    device: u32,
+    tsout: u32,
+    tsinfo: u32,
+    conn_tsout: u32,
+    conn_tsinfo: u32,
+    conn_video: u32,
+    conn_audio: u32,
+    running: bool,
+    streams_added: bool,
+    program_added: bool,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct CloseReport {
+    /// False only for a resource that is still present after teardown; a
+    /// timeout that a retry clears is cleanup noise, not a leak.
+    cleanup_ok: bool,
+    benign_timeouts: u32,
+    leaked_buffers: Vec<u32>,
+    leaked_device: Option<u32>,
+}
+
+impl CloseReport {
+    fn describe_leaks(&self) -> String {
+        let mut parts = Vec::new();
+        if let Some(device) = self.leaked_device {
+            parts.push(format!("REMUX device {device:#x}"));
+        }
+        for buffer in &self.leaked_buffers {
+            parts.push(format!("buffer {buffer:#x}"));
+        }
+        if parts.is_empty() {
+            "unknown handle".to_string()
+        } else {
+            parts.join(" and ")
+        }
+    }
+}
+
+/// `XCE_TIMEOUT (1038)` and `XCE_CANCELLED (1039)` are the driver's way of
+/// saying "the peer is busy or already gone". During teardown they are worth
+/// one retry; after the retry they are cleanup noise, because the presence
+/// checks that follow decide whether anything really leaked.
+fn timeout_noise(e: &io::Error) -> bool {
+    matches!(e.raw_os_error(), Some(1038 | 1039))
+}
+
+fn retry_cleanup<T>(
+    label: &str,
+    attempts: u32,
+    delay: Duration,
+    mut op: impl FnMut() -> io::Result<T>,
+) -> io::Result<T> {
+    let attempts = attempts.max(1);
+    let mut last: Option<io::Error> = None;
+    for attempt in 0..attempts {
+        match op() {
+            Ok(value) => return Ok(value),
+            Err(e) => {
+                if !timeout_noise(&e) || attempt + 1 == attempts {
+                    return Err(e);
+                }
+                eprintln!("remux4k: teardown {label}: {e}; retrying");
+                last = Some(e);
+                std::thread::sleep(delay);
+            }
+        }
+    }
+    Err(last.unwrap_or_else(|| io::Error::other("no teardown attempt was made")))
+}
+
+/// Run the graph teardown once. Handles are cleared as they are consumed,
+/// even when a destroy fails, so a second call cannot destroy the same
+/// handle twice; the leak is carried in the returned report instead.
+fn close_graph<O: RemuxOps + ?Sized>(
+    ops: &O,
+    handles: &mut CloseHandles,
+    service_id: u32,
+) -> CloseReport {
+    let mut report = CloseReport {
+        cleanup_ok: true,
+        ..Default::default()
+    };
+    let device = handles.device;
+
+    // 1. Detach the outputs first. Retry immediately; if the writer is parked
+    //    in a full ring the retry after stop_device is the one that clears.
+    let mut retry_outputs: Vec<(&'static str, u32)> = Vec::new();
+    for (label, connection) in [
+        ("TSOUT output", handles.conn_tsout),
+        ("TSINFO output", handles.conn_tsinfo),
+    ] {
+        if connection == 0 || device == 0 {
+            continue;
+        }
+        match retry_cleanup(label, 2, Duration::from_millis(100), || {
+            ops.disconnect(device, connection, 3000)
+        }) {
+            Ok(()) => {}
+            Err(e) if timeout_noise(&e) => {
+                report.benign_timeouts += 1;
+                eprintln!(
+                    "remux4k: teardown {label} {connection:#x}: {e} (benign after retry; \
+                     retrying after stop)"
+                );
+                retry_outputs.push((label, connection));
+            }
+            Err(e) => {
+                report.cleanup_ok = false;
+                eprintln!("remux4k: teardown {label} {connection:#x} failed: {e}");
+            }
+        }
+    }
+    handles.conn_tsout = 0;
+    handles.conn_tsinfo = 0;
+
+    // 2. Stop the device, then retry the output detach that timed out: a
+    //    stopped writer can answer even if it was parked before.
+    if handles.running && device != 0 {
+        match retry_cleanup("stop", 3, Duration::from_millis(150), || {
+            ops.stop_device(device, 3000)
+        }) {
+            Ok(()) => {}
+            Err(e) if timeout_noise(&e) => {
+                report.benign_timeouts += 1;
+                eprintln!(
+                    "remux4k: teardown stop {device:#x}: {e} (benign after retry; the \
+                     ring presence checks below decide whether anything leaked)"
+                );
+            }
+            Err(e) => {
+                report.cleanup_ok = false;
+                eprintln!("remux4k: teardown stop {device:#x} failed: {e}");
+            }
+        }
+    }
+    handles.running = false;
+
+    for (label, connection) in retry_outputs {
+        match retry_cleanup(label, 2, Duration::from_millis(100), || {
+            ops.disconnect(device, connection, 3000)
+        }) {
+            Ok(()) => {}
+            Err(e) if timeout_noise(&e) => {
+                report.benign_timeouts += 1;
+                eprintln!(
+                    "remux4k: teardown {label} {connection:#x} after stop: {e} \
+                     (benign after retry)"
+                );
+            }
+            Err(e) => {
+                report.cleanup_ok = false;
+                eprintln!("remux4k: teardown {label} {connection:#x} after stop failed: {e}");
+            }
+        }
+    }
+
+    // 3. Remove the program's streams and the program itself while the
+    //    device still exists.
+    if handles.streams_added && device != 0 {
+        for (label, connection) in [("video", handles.conn_video), ("audio", handles.conn_audio)] {
+            if connection == 0 {
+                continue;
+            }
+            match retry_cleanup(
+                &format!("remove {label} stream"),
+                2,
+                Duration::from_millis(100),
+                || ops.remove_stream(device, connection, service_id),
+            ) {
+                Ok(()) => {}
+                Err(e) if timeout_noise(&e) => {
+                    report.benign_timeouts += 1;
+                    eprintln!("remux4k: teardown remove {label} stream: {e} (benign after retry)");
+                }
+                Err(e) => {
+                    report.cleanup_ok = false;
+                    eprintln!("remux4k: teardown remove {label} stream failed: {e}");
+                }
+            }
+        }
+    }
+    handles.streams_added = false;
+
+    if handles.program_added && device != 0 {
+        match retry_cleanup("remove program", 2, Duration::from_millis(100), || {
+            ops.remove_program(device, service_id)
+        }) {
+            Ok(()) => {}
+            Err(e) if timeout_noise(&e) => {
+                report.benign_timeouts += 1;
+                eprintln!("remux4k: teardown remove program: {e} (benign after retry)");
+            }
+            Err(e) => {
+                report.cleanup_ok = false;
+                eprintln!("remux4k: teardown remove program failed: {e}");
+            }
+        }
+    }
+    handles.program_added = false;
+
+    // 4. Detach the live ES inputs after the program is gone, as the product's
+    //    own `remux_seq_stop` ordering does.
+    for (label, connection) in [
+        ("video ES input", handles.conn_video),
+        ("audio ES input", handles.conn_audio),
+    ] {
+        if connection == 0 || device == 0 {
+            continue;
+        }
+        match retry_cleanup(label, 2, Duration::from_millis(100), || {
+            ops.disconnect(device, connection, 3000)
+        }) {
+            Ok(()) => {}
+            Err(e) if timeout_noise(&e) => {
+                report.benign_timeouts += 1;
+                eprintln!("remux4k: teardown {label} {connection:#x}: {e} (benign after retry)");
+            }
+            Err(e) => {
+                report.cleanup_ok = false;
+                eprintln!("remux4k: teardown {label} {connection:#x} failed: {e}");
+            }
+        }
+    }
+    handles.conn_video = 0;
+    handles.conn_audio = 0;
+
+    // 5. Flush and destroy the host rings. The writer/reader counters are
+    //    polled the same way `bs2k` does; a ring that still answers
+    //    GET_STATUS after destroy is the wedge that fails the next open.
+    for (label, buffer) in [("TSOUT", handles.tsout), ("TSINFO", handles.tsinfo)] {
+        if buffer == 0 {
+            continue;
+        }
+        let mut clear = false;
+        for _ in 0..40 {
+            clear = ops
+                .sbuf_status(buffer)
+                .is_ok_and(|s| s[8] == 0 && s[9] == 0);
+            if clear {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        if !clear {
+            eprintln!(
+                "remux4k: teardown {label} {buffer:#x} still has a live writer/reader; \
+                 forcing a reset before destroy"
+            );
+        }
+        match retry_cleanup(
+            &format!("reset {label}"),
+            2,
+            Duration::from_millis(100),
+            || ops.force_reset_buffer(buffer),
+        ) {
+            Ok(()) => {}
+            Err(e) if timeout_noise(&e) => {
+                report.benign_timeouts += 1;
+                eprintln!("remux4k: teardown reset {label}: {e} (benign after retry)");
+            }
+            Err(e) => eprintln!("remux4k: teardown reset {label} failed: {e}"),
+        }
+        match retry_cleanup(
+            &format!("destroy {label}"),
+            2,
+            Duration::from_millis(100),
+            || ops.destroy_buffer(buffer),
+        ) {
+            Ok(()) => {
+                if ops.sbuf_status(buffer).is_ok() {
+                    report.cleanup_ok = false;
+                    report.leaked_buffers.push(buffer);
+                    eprintln!(
+                        "remux4k: teardown destroy {label} {buffer:#x} reported success but \
+                         the ring is still present; could not release it (next open will \
+                         fail with os error 1038 until reboot)"
+                    );
+                }
+            }
+            Err(e) => {
+                report.cleanup_ok = false;
+                report.leaked_buffers.push(buffer);
+                eprintln!(
+                    "remux4k: teardown destroy {label} {buffer:#x} failed: {e}; could not \
+                     release it (next open will fail with os error 1038 until reboot)"
+                );
+            }
+        }
+    }
+    handles.tsout = 0;
+    handles.tsinfo = 0;
+
+    // 6. Destroy the device last, once nothing points at it.
+    if device != 0 {
+        match retry_cleanup("destroy REMUX", 2, Duration::from_millis(100), || {
+            ops.destroy_device(device)
+        }) {
+            Ok(()) => handles.device = 0,
+            Err(e) => {
+                report.cleanup_ok = false;
+                report.leaked_device = Some(device);
+                eprintln!(
+                    "remux4k: teardown destroy REMUX {device:#x} failed: {e}; could not \
+                     release it (next open will fail with os error 1038 until reboot)"
+                );
+            }
+        }
+    }
+    handles.device = 0;
+    handles.running = false;
+
+    report
 }
 
 impl TsSource for Tap {
@@ -844,6 +1234,202 @@ impl Drop for Tap {
             self.unwrap.packets,
             self.unwrap.resyncs
         );
-        self.teardown();
+        self.close();
+    }
+}
+
+#[cfg(test)]
+mod close_tests {
+    use super::*;
+    use std::cell::RefCell;
+    use std::collections::{HashMap, HashSet};
+
+    struct FakeOps {
+        calls: RefCell<Vec<String>>,
+        status_calls: RefCell<Vec<u32>>,
+        destroyed: RefCell<HashSet<u32>>,
+        keep_buffers: RefCell<HashSet<u32>>,
+        failures: RefCell<HashMap<String, Vec<io::Error>>>,
+    }
+
+    impl FakeOps {
+        fn new() -> Self {
+            Self {
+                calls: RefCell::new(Vec::new()),
+                status_calls: RefCell::new(Vec::new()),
+                destroyed: RefCell::new(HashSet::new()),
+                keep_buffers: RefCell::new(HashSet::new()),
+                failures: RefCell::new(HashMap::new()),
+            }
+        }
+
+        fn fail(&self, key: &str, codes: &[i32]) {
+            self.failures.borrow_mut().insert(
+                key.to_string(),
+                codes
+                    .iter()
+                    .map(|&c| io::Error::from_raw_os_error(c))
+                    .collect(),
+            );
+        }
+
+        fn keep(&self, buffer: u32) {
+            self.keep_buffers.borrow_mut().insert(buffer);
+        }
+
+        fn record(&self, call: String) {
+            self.calls.borrow_mut().push(call);
+        }
+
+        fn maybe_fail(&self, key: &str) -> io::Result<()> {
+            let mut failures = self.failures.borrow_mut();
+            if let Some(queue) = failures.get_mut(key) {
+                if !queue.is_empty() {
+                    return Err(queue.remove(0));
+                }
+            }
+            Ok(())
+        }
+    }
+
+    impl RemuxOps for FakeOps {
+        fn sbuf_status(&self, buffer: u32) -> io::Result<[u32; 12]> {
+            self.status_calls.borrow_mut().push(buffer);
+            if self.destroyed.borrow().contains(&buffer) {
+                Err(io::Error::from_raw_os_error(2))
+            } else {
+                Ok([0u32; 12])
+            }
+        }
+
+        fn remove_stream(&self, _device: u32, connection: u32, _program: u32) -> io::Result<()> {
+            self.record(format!("remove_stream({connection:#x})"));
+            self.maybe_fail(&format!("remove_stream({connection:#x})"))
+        }
+
+        fn remove_program(&self, _device: u32, _program: u32) -> io::Result<()> {
+            self.record("remove_program".to_string());
+            self.maybe_fail("remove_program")
+        }
+
+        fn disconnect(&self, _device: u32, connection: u32, _timeout_ms: u32) -> io::Result<()> {
+            self.record(format!("disconnect({connection:#x})"));
+            self.maybe_fail(&format!("disconnect({connection:#x})"))
+        }
+
+        fn stop_device(&self, _device: u32, _timeout_ms: u32) -> io::Result<()> {
+            self.record("stop".to_string());
+            self.maybe_fail("stop")
+        }
+
+        fn force_reset_buffer(&self, buffer: u32) -> io::Result<()> {
+            self.record(format!("reset({buffer:#x})"));
+            self.maybe_fail(&format!("reset({buffer:#x})"))
+        }
+
+        fn destroy_buffer(&self, buffer: u32) -> io::Result<()> {
+            self.record(format!("destroy_buffer({buffer:#x})"));
+            self.maybe_fail(&format!("destroy_buffer({buffer:#x}"))?;
+            if !self.keep_buffers.borrow().contains(&buffer) {
+                self.destroyed.borrow_mut().insert(buffer);
+            }
+            Ok(())
+        }
+
+        fn destroy_device(&self, _device: u32) -> io::Result<()> {
+            self.record("destroy_device".to_string());
+            self.maybe_fail("destroy_device")
+        }
+    }
+
+    fn full_handles() -> CloseHandles {
+        CloseHandles {
+            device: 0x70,
+            tsout: 0x60,
+            tsinfo: 0x61,
+            conn_tsout: 0x50,
+            conn_tsinfo: 0x51,
+            conn_video: 0x52,
+            conn_audio: 0x53,
+            running: true,
+            streams_added: true,
+            program_added: true,
+        }
+    }
+
+    #[test]
+    fn teardown_detaches_outputs_stops_then_destroys_rings_before_the_device() {
+        let ops = FakeOps::new();
+        let mut handles = full_handles();
+        let report = close_graph(&ops, &mut handles, 1);
+        assert!(report.cleanup_ok);
+        assert!(report.leaked_buffers.is_empty());
+        assert_eq!(report.leaked_device, None);
+        assert_eq!(
+            ops.calls.into_inner(),
+            vec![
+                "disconnect(0x50)",
+                "disconnect(0x51)",
+                "stop",
+                "remove_stream(0x52)",
+                "remove_stream(0x53)",
+                "remove_program",
+                "disconnect(0x52)",
+                "disconnect(0x53)",
+                "reset(0x60)",
+                "destroy_buffer(0x60)",
+                "reset(0x61)",
+                "destroy_buffer(0x61)",
+                "destroy_device",
+            ]
+        );
+        assert_eq!(handles, CloseHandles::default());
+    }
+
+    #[test]
+    fn second_close_is_a_no_op_and_does_not_destroy_anything_twice() {
+        let ops = FakeOps::new();
+        let mut handles = full_handles();
+        let first = close_graph(&ops, &mut handles, 1);
+        assert!(first.cleanup_ok);
+        let call_count = ops.calls.borrow().len();
+
+        let second = close_graph(&ops, &mut handles, 1);
+        assert!(second.cleanup_ok);
+        assert_eq!(ops.calls.borrow().len(), call_count);
+        assert_eq!(handles, CloseHandles::default());
+    }
+
+    #[test]
+    fn os_error_1038_on_disconnect_is_retried_and_then_benign() {
+        let ops = FakeOps::new();
+        // Two attempts before stop, two more after stop; all time out.
+        ops.fail("disconnect(0x50)", &[1038, 1038, 1038, 1038]);
+        let mut handles = full_handles();
+        let report = close_graph(&ops, &mut handles, 1);
+
+        assert!(
+            report.cleanup_ok,
+            "a cleared timeout must not count as a leak"
+        );
+        assert!(
+            report.benign_timeouts >= 2,
+            "both the immediate and post-stop disconnects should be reported as benign"
+        );
+        assert!(report.leaked_buffers.is_empty());
+        assert_eq!(handles, CloseHandles::default());
+    }
+
+    #[test]
+    fn a_ring_that_survives_destroy_is_reported_as_a_hard_leak() {
+        let ops = FakeOps::new();
+        ops.keep(0x60);
+        let mut handles = full_handles();
+        let report = close_graph(&ops, &mut handles, 1);
+
+        assert!(!report.cleanup_ok);
+        assert_eq!(report.leaked_buffers, vec![0x60]);
+        assert!(ops.failures.borrow().is_empty());
+        assert_eq!(handles, CloseHandles::default());
     }
 }

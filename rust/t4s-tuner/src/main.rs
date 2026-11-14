@@ -267,7 +267,13 @@ fn run_4k(args: &Args, deadline: Option<Instant>) -> Result<(), String> {
             remux4k::Tap::open(Arc::clone(&drv), cfg).map_err(|e| format!("REMUX open: {e}"))?
         }
     };
-    pump(tap, deadline).map_err(|e| format!("BS4K stream: {e}"))
+    let outcome = pump(tap, deadline);
+    // `pump` owns the tap, so its teardown has already run and the driver
+    // fd is still open. Give the ARC a moment to finish destroying the
+    // REMUX device and its rings; exiting immediately lets the next open
+    // race the teardown and fail with os error 1038.
+    std::thread::sleep(Duration::from_millis(300));
+    outcome.map_err(|e| format!("BS4K stream: {e}"))
 }
 
 fn run_2k(args: &Args, deadline: Option<Instant>) -> Result<(), String> {
