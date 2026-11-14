@@ -1401,36 +1401,75 @@ API #1 自体は健全な 4K TS を返している（旧 §13.1 と同じ）。
 - ビルド: `cargo +1.99.0 build --release --target armv7-unknown-linux-musleabihf
   -p t4s-tuner` → 成功 / md5 `4598d1bc7e1d5c92b1ce2ca703165c27` / 568,668 B。
 
-### 18.5 実機検証手順（未実施）
+### 18.5 実機検証（2026-11-15 実施、**部分的に成功・非決定**）
 
-前提: 本体ボタン＋再起動で緑復帰（`MIXER/Sink=true`, `discover=Ok(1,2)`）。
-配置: 新 `t4s-tuner`（md5 `4598d1bc…`）を `/mnt/t4s/opt/t4s/bin/t4s-tuner` へ。
+配置した新 `t4s-tuner`（md5 `4598d1bc7e1d5c92b1ce2ca703165c27` / 568,668 B /
+`-rwxr-xr-x`）で、mirakc API の同一局 4K 連続取得を **2 回**実施した。結果は
+**非決定**で、3 連続が通る回と 3 回目が落ちる回があった。
 
-1. 緑確認: `t4s-probe-new discover` → `Ok(video_readers 1, audio_readers 2)`。
-2. mirakc 起動（`sh /media/usb/ondevice-up.sh`）。
-3. API を **10 秒間隔で 3 回**:
-   ```sh
-   for i in 1 2 3; do
-     curl -sS --max-time 20 -o /tmp/api4k-$i.ts \
-       -w "run $i code=%{http_code} bytes=%{size_download}\n" \
-       'http://127.0.0.1:40772/api/channels/BS4K/45170/stream?decode=1'
-     t4s-probe-new discover
-     sleep 10
-   done
-   ```
-4. 合格条件:
-   - 3 回とも HTTP **200** / bytes > 0。
-   - 各回後の `discover` が **Ok(readers 1/2)** のまま（**readers が 1/2 から
-     2/3 等へ増えない**こと = leak していない）。
-   - 3 回目後も `MIXER/Sink=true`。
-5. 不合格（404 / Err / readers 増加）なら、即停止し `/tmp/api4k-*.ts` と
-   `discover`、mirakc ログを保存。再起動で復帰し、原因を再解析する。
+#### 18.5.1 1 回目（01:52–01:58 JST、緑復帰直後）= **3/3 成功**
+
+mirakc pid 916。各回の間に discover 観測（実効間隔 1.5–2.5 分）。
+
+| 回 | 時刻 | HTTP | bytes | 先頭 4B | 直後 readers | threads |
+|---:|---|---:|---:|---|---|---|
+| 1 | 01:53:23 | **200** | 67,403,776 | `47 40 00 10` | 2/3 → 数秒で **1/2 に復帰** | MIXER/Sink=true |
+| 2 | 01:54:57 | **200** | 16,957,412 | `47 40 00 10` | 一過性 Err → **1/2 に復帰** | true |
+| 3 | 01:57:20 | **200** | 17,277,012 | `47 40 00 10` | 一過性 Err → **1/2 に復帰** | true |
+
+- 3 回とも **HTTP 200 / bytes>0**。各回直後の readers は一時 2/3 になるが、tap の
+  teardown が完走して **1/2 に戻った**（§17 の旧版は 2/3 のまま残り 404 だった）。
+- 3 回目後も `MIXER/Sink=true`。**この回は合格条件を満たした。**
+
+#### 18.5.2 2 回目（02:31–02:46 JST、再起動後）= **2/3 で失敗**
+
+実機は 02:24 にユーザー再起動（uptime 1833s→緑）。mirakc pid 932。配置 binary は
+同じ md5 `4598d1bc`（オーケストレーターの「旧版 sha256 `0fc2682c`」は
+**同じ新ビルドの別ハッシュ表記**で、配置は正しかった）。
+
+| 回 | 時刻 | HTTP | bytes | 先頭 4B | 直後 readers | threads |
+|---:|---|---:|---:|---|---|---|
+| 1 | 02:34:07 | **200** | 67,534,848 | `47 40 00 10` | 2/3 → **1/2 に復帰** | MIXER/Sink=true |
+| 2 | 02:36:19 | **200** | 55,377,920 | `47 40 00 10` | 2/3 → 0/0 → **1/2 に復帰** | true |
+| 3 | 02:38:18 | **408** | 38 | `7b22636f`（`{"code":408…`） | **Err（持続）** | true → 後に **false** |
+
+mirakc ログ: `stream.id=0.0.1`(17:34:06–17:34:28) / `0.1.1`(17:36:18–17:36:41) /
+`0.2.1`(17:38:17–17:38:35、408)。3 回目は tuner が起動したが最初の TS パケットを
+得られず 18 秒で停止（§13.2 と同じ 408）。以後 `discover=Err` が持続し、
+MIXER/Sink=false に降下。**プロトコルどおり即停止**（send/キーなし）。
+
+#### 18.5.3 判定
+
+- **合格条件（3 回とも 200 / readers 増えない / MIXER/Sink 維持）は 1 回目のみ満たし、
+  2 回目は満たさなかった → 全体としては「不合格（非決定）」**。
+- ただし **旧版（§17）からの改善は明確**:
+  - 旧版: API#1 200 → API#2 **404** → discover=Err（毎回再現）。
+  - 新版: API#2 が **200** になり、各 capture 後の readers が **1/2 に復帰**する。
+  - 改善幅は「連続 1 回 → 2 回（時に 3 回）」。
+- **1 回目と 2 回目の差は未確定**。1 回目は #2/#3 の取得が ~17 MB と短かった
+  （20 秒窓に対し ~5 秒相当）のに対し、2 回目は #2 が 55 MB と長く、製品 ES ring への
+  負荷が大きかった可能性がある（**推測**）。連続取得の負荷蓄積が 3 回目で閾値を
+  越えると推定。
+- いずれの回も API#1 は安定して 200（§13.1 と一致）。
+
+#### 18.5.4 ffprobe（1 回目 API#1 相当の 4K TS）
+
+配置後 1 回目の API#1（`.tmp/api4k-final/r1.ts`）:
+- container mpegts / sync ratio 1.0。
+- video: **hevc / Main 10 / 3840x2160 / color_transfer=arib-std-b67 (HLG)**。
+- audio: **aac_latm / LC / 48000 Hz / 2ch**。
 
 ### 18.6 残課題
 
-- 実機検証は **未実施**（緑復帰待ち）。
-- 予算 700 ms で全 op を打ち切る場合、掃除しきれない resource が生じ得る。ただし
-  **kill されるより「早期に離脱して実体を減らす」方が次 open の成功率が高い**と
-  考えられる（仮説）。実機で readers が増えないことを確認する必要がある。
-- mirakc 側の SIGTERM 猶予を延ばす（`MIRAKC_COMMAND_PIPELINE_SIGTERM_GRACE_NANOS`）
-  選択肢もあるが、サーバ設定側の変更であり本節の範囲外。
+- 実機検証は実施済みだが **非決定**（3/3 の回と 2/3 の回）。合格条件は安定しては
+  満たせていない。
+- 予算 700 ms で全 op を打ち切るため、掃除しきれない resource が残り得る。今回
+  readers は 1/2 に復帰したが、負荷が高い capture の連続で 3 回目が落ちた。
+- 次の対策候補（未実装）:
+  - 各 capture 間で製品 ES ring が落ち着くまで待つ（クライアント側で間隔を長く取る）。
+  - mirakc 側の SIGTERM 猶予延長（`MIRAKC_COMMAND_PIPELINE_SIGTERM_GRACE_NANOS`）で
+    teardown に余裕を持たせる。
+  - capture が短く終わる原因（20 秒窓で ~5 秒分しか来ない回）の解明。
+- mirakc ログには t4s-tuner の stderr（`remux4k:` / `1038`）が残っていない
+  （現行ログレベル）。**teardown leak の有無は mirakc ログからは確認できない**。
+  次回は `RUST_LOG` を上げるか、t4s-tuner の stderr をファイルへ回す。
