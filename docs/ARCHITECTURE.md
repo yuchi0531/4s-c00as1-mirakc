@@ -49,9 +49,11 @@ mirakc は USB 上の ext4 イメージ内の Alpine rootfs で動きます。
 
 - `--type BS|CS`: stdin の TS から PAT/PMT/ECM を追跡し、本体 `card` デーモンに
   問い合わせて MULTI2 を復号する。全サービス同時復号モード。
-  起動ゲートは PAT の全 PMT PID が揃うまで待つため、PAT にあるが当該 TS に
-  現れない PMT（例: BS13_0 の 1025/1026）があると 4 MiB で abort し、
-  mirakc では `decode=1` が 404 になる（既知・ring とは別）。
+  起動ゲートは PAT の全 PMT PID が揃うまで待つが、起動バジェット（4 MiB /
+  22,000 パケット）に達した場合は、PAT にあるが当該 TS に現れない PMT
+  （例: BS13_0 の 1025/1026）を待たずに、到着済みの PMT だけで部分開始する
+  （warning を 1 回出す）。全 PMT が揃う通常ケースは従来どおりで、宣言 PMT が
+  1 つも来ない場合は従来どおり fail-closed。遅れて届いた PMT/ECM は随時追加する。
 - `--type BS4K`: 本体 ACAS が既に復号しているため、バイト列をそのまま通す。
 - 引数: `--type {{{channel_type}}} --channel {{{channel}}}`
 
